@@ -132,3 +132,23 @@ func TestExtractLiteral(t *testing.T) {
 		t.Errorf("fixed literal mangled: %q", got)
 	}
 }
+
+func TestPlainLiteralFastPath(t *testing.T) {
+	ix := New("/r")
+	add(ix, "a.go", "Foo LeaderElection bar\nleaderelection lower\nLEADERELECTION upper\n")
+	re := regexp.MustCompile("(?i)leaderelection")
+	res := ix.Search(re, SearchOpts{Literal: "leaderelection", PlainLiteral: "leaderelection", FoldCase: true})
+	if len(res.Matches) != 3 {
+		t.Fatalf("fold fast path: got %d matches, want 3: %+v", len(res.Matches), res.Matches)
+	}
+	res = ix.Search(regexp.MustCompile("LeaderElection"), SearchOpts{Literal: "leaderelection", PlainLiteral: "LeaderElection"})
+	if len(res.Matches) != 1 {
+		t.Fatalf("case-sensitive fast path: got %d, want 1", len(res.Matches))
+	}
+	if lit, ok := PlainLiteral("Get.*User", false); ok {
+		t.Fatalf("regex wrongly classified as literal: %q", lit)
+	}
+	if lit, ok := PlainLiteral("a.b", true); !ok || lit != "a.b" {
+		t.Fatalf("fixed pattern not literal: %q %v", lit, ok)
+	}
+}

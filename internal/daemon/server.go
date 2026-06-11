@@ -9,11 +9,13 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/zliss/gcgrep/internal/index"
@@ -26,11 +28,18 @@ type Server struct {
 	mu       sync.Mutex
 	stores   map[string]*RootStore
 	cacheDir string
-	quit     chan struct{}
+	quit     chan struct{} // closed when shutdown begins (stop accepting)
+	stopped  chan struct{} // closed when all stores are saved
+	stopOnce sync.Once
 }
 
 func NewServer(cacheDir string) *Server {
-	return &Server{stores: make(map[string]*RootStore), cacheDir: cacheDir, quit: make(chan struct{})}
+	return &Server{
+		stores:   make(map[string]*RootStore),
+		cacheDir: cacheDir,
+		quit:     make(chan struct{}),
+		stopped:  make(chan struct{}),
+	}
 }
 
 // Serve accepts connections until Stop. It is the daemon main loop.
@@ -44,6 +53,7 @@ func (sv *Server) Serve(l net.Listener) error {
 		if err != nil {
 			select {
 			case <-sv.quit:
+				<-sv.stopped // index persistence must finish before exit
 				return nil
 			default:
 				return err
@@ -57,6 +67,14 @@ func (sv *Server) Serve(l net.Listener) error {
 func (sv *Server) Quit() <-chan struct{} { return sv.quit }
 
 func (sv *Server) stopAll() {
+	sv.stopOnce.Do(sv.doStop)
+}
+
+func (sv *Server) doStop() {
+	// stop accepting new connections first: persisting large indexes can
+	// take seconds and new clients must spawn a fresh daemon, not reach a
+	// half-shut-down one
+	close(sv.quit)
 	sv.mu.Lock()
 	stores := make([]*RootStore, 0, len(sv.stores))
 	for _, s := range sv.stores {
@@ -66,7 +84,7 @@ func (sv *Server) stopAll() {
 	for _, s := range stores {
 		s.Close()
 	}
-	close(sv.quit)
+	close(sv.stopped)
 }
 
 // store returns the RootStore covering path: an existing root that equals
@@ -154,6 +172,16 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 		Literal:   index.ExtractLiteral(req.Pattern, req.Fixed),
 		FilesOnly: req.Files || req.Count,
 		Limit:     req.Limit,
+	}
+	// pure literals skip the regex engine; the ASCII fold fast path is
+	// only safe when the needle itself is ASCII
+	if lit, ok := index.PlainLiteral(req.Pattern, req.Fixed); ok {
+		if !req.NoCase {
+			opts.PlainLiteral = lit
+		} else if !index.HasNonASCII(lit) {
+			opts.PlainLiteral = lit
+			opts.FoldCase = true
+		}
 	}
 	if pm, perr := globMatcher(req.Globs); perr != nil {
 		_ = send(proto.Event{Type: "error", Msg: "bad glob: " + perr.Error()})
@@ -282,6 +310,17 @@ func Run(l net.Listener, cacheDir, logPath string) error {
 	}
 	log.Printf("gcgrep daemon %s starting, pid=%d", proto.Version, os.Getpid())
 	sv := NewServer(cacheDir)
+	// persist indexes on SIGTERM/SIGINT (service managers, pkill)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case s := <-sig:
+			log.Printf("signal %v: saving and exiting", s)
+			sv.stopAll()
+		case <-sv.quit:
+		}
+	}()
 	err := sv.Serve(l)
 	log.Printf("gcgrep daemon exiting: %v", err)
 	return err

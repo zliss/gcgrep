@@ -66,17 +66,33 @@ func trigramsOf(content []byte, seen map[uint32]struct{}) {
 	}
 }
 
+// TrigramKeys computes the deduplicated trigram set of content. It takes
+// no lock, so callers can parallelize this (the expensive part of Add)
+// across files and only serialize the insertion.
+func TrigramKeys(content []byte) []uint32 {
+	seen := make(map[uint32]struct{}, len(content)/2)
+	trigramsOf(content, seen)
+	keys := make([]uint32, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // Add inserts or replaces a file. content must not be mutated afterwards.
 func (ix *Index) Add(meta FileMeta, content []byte) {
+	ix.AddWithKeys(meta, content, TrigramKeys(content))
+}
+
+// AddWithKeys is Add with the trigram set precomputed via TrigramKeys.
+func (ix *Index) AddWithKeys(meta FileMeta, content []byte, keys []uint32) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	ix.removeLocked(meta.Path)
 	id := uint32(len(ix.files))
 	ix.files = append(ix.files, &fileEntry{meta: meta, content: content})
 	ix.byPath[meta.Path] = id
-	seen := make(map[uint32]struct{}, len(content)/2)
-	trigramsOf(content, seen)
-	for k := range seen {
+	for _, k := range keys {
 		ix.tri[k] = append(ix.tri[k], id)
 	}
 	ix.maybeCompactLocked()
@@ -188,6 +204,12 @@ type SearchOpts struct {
 	PathMatch func(path string) bool
 	FilesOnly bool
 	Limit     int // max matches; 0 = unlimited
+
+	// PlainLiteral, when non-empty, replaces the regex with a direct
+	// bytes.Index scan (FoldCase = ASCII case-insensitive). The regex is
+	// still passed for interface uniformity but not executed.
+	PlainLiteral string
+	FoldCase     bool
 }
 
 type SearchResult struct {
@@ -201,6 +223,7 @@ func (ix *Index) Search(re *regexp.Regexp, opts SearchOpts) SearchResult {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	res := SearchResult{FileCounts: make(map[string]int)}
+	lit := []byte(opts.PlainLiteral)
 	for _, id := range ix.candidatesLocked(opts.Literal) {
 		f := ix.files[id]
 		if f.dead {
@@ -209,7 +232,12 @@ func (ix *Index) Search(re *regexp.Regexp, opts SearchOpts) SearchResult {
 		if opts.PathMatch != nil && !opts.PathMatch(f.meta.Path) {
 			continue
 		}
-		locs := re.FindAllIndex(f.content, -1)
+		var locs [][]int
+		if len(lit) > 0 {
+			locs = literalFindAll(f.content, lit, opts.FoldCase)
+		} else {
+			locs = re.FindAllIndex(f.content, -1)
+		}
 		if len(locs) == 0 {
 			continue
 		}

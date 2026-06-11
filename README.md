@@ -7,7 +7,11 @@ milliseconds — no per-search filesystem scan, which is what makes `grep -r`
 slow and CPU-hungry, especially on Windows 11 (NTFS + Defender real-time
 scanning of every opened file).
 
-- **Fast**: 30k files index in ~1.6 s; warm literal query ~4 ms end to end.
+- **Fast** (kubernetes/kubernetes, 30k files): warm literal query 5 ms on
+  macOS / 37 ms on Win11 end to end, vs `grep -r` 0.26 s (macOS) and
+  `findstr /s` 1.8 s / `Select-String` 9.4 s (Win11). One-time cold index:
+  8 s (macOS) / 55 s (Win11, Defender-bound); daemon restart reloads the
+  persisted index in a fraction of that.
 - **Live**: file create/modify/delete is picked up within ~1 s automatically.
 - **Restart-safe**: indexes persist to disk; on daemon restart a stat-only
   reconcile pass catches everything that changed while it was down.
