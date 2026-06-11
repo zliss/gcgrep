@@ -22,7 +22,7 @@ mkdir -p dist
 GOOS=linux   GOARCH=arm64 go build -trimpath -o dist/gcgrep-linux-arm64   ./cmd/gcgrep
 GOOS=darwin  GOARCH=arm64 go build -trimpath -o dist/gcgrep-darwin-arm64  ./cmd/gcgrep
 GOOS=windows GOARCH=amd64 go build -trimpath -o dist/gcgrep-windows-amd64.exe ./cmd/gcgrep
-for pkg in index ignore daemon; do
+for pkg in index ignore daemon symbol; do
   GOOS=darwin  GOARCH=arm64 go test -c -o dist/\${pkg}_test_darwin  ./internal/\$pkg
   GOOS=windows GOARCH=amd64 go test -c -o dist/\${pkg}_test_windows.exe ./internal/\$pkg
 done

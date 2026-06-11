@@ -2,7 +2,7 @@
 // Each request and each response event is one JSON object per line.
 package proto
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 type Request struct {
 	Op      string   `json:"op"` // "search" | "status" | "stop"
@@ -32,6 +32,11 @@ type Event struct {
 	Line  int    `json:"line,omitempty"`
 	Text  string `json:"text,omitempty"`
 	Count int    `json:"count,omitempty"`
+
+	// symbol matches (def / refs / symbols)
+	Name      string `json:"name,omitempty"`
+	Kind      string `json:"kind,omitempty"` // class/struct/interface/enum/type/func/method | call/ref
+	Container string `json:"container,omitempty"`
 
 	// done
 	Matches   int   `json:"matches,omitempty"`

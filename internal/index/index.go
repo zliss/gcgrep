@@ -10,7 +10,10 @@ package index
 import (
 	"bytes"
 	"regexp"
+	"strings"
 	"sync"
+
+	"github.com/zliss/gcgrep/internal/symbol"
 )
 
 // MaxFileSize bounds indexed file size; larger files are skipped like binaries.
@@ -30,6 +33,7 @@ type FileMeta struct {
 type fileEntry struct {
 	meta    FileMeta
 	content []byte
+	defs    []symbol.Def
 	dead    bool
 }
 
@@ -80,17 +84,18 @@ func TrigramKeys(content []byte) []uint32 {
 }
 
 // Add inserts or replaces a file. content must not be mutated afterwards.
+// Trigrams and symbol definitions are computed outside the lock.
 func (ix *Index) Add(meta FileMeta, content []byte) {
-	ix.AddWithKeys(meta, content, TrigramKeys(content))
+	ix.AddWithKeys(meta, content, TrigramKeys(content), symbol.Extract(meta.Path, content))
 }
 
-// AddWithKeys is Add with the trigram set precomputed via TrigramKeys.
-func (ix *Index) AddWithKeys(meta FileMeta, content []byte, keys []uint32) {
+// AddWithKeys is Add with trigrams and defs precomputed (for parallel build).
+func (ix *Index) AddWithKeys(meta FileMeta, content []byte, keys []uint32, defs []symbol.Def) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	ix.removeLocked(meta.Path)
 	id := uint32(len(ix.files))
-	ix.files = append(ix.files, &fileEntry{meta: meta, content: content})
+	ix.files = append(ix.files, &fileEntry{meta: meta, content: content, defs: defs})
 	ix.byPath[meta.Path] = id
 	for _, k := range keys {
 		ix.tri[k] = append(ix.tri[k], id)
@@ -178,19 +183,118 @@ func (ix *Index) NumFiles() int {
 	return len(ix.byPath)
 }
 
-// Snapshot returns metadata and content of all live files (for persistence).
-func (ix *Index) Snapshot() ([]FileMeta, [][]byte) {
+// Snapshot returns metadata, content and defs of all live files (for
+// persistence).
+func (ix *Index) Snapshot() ([]FileMeta, [][]byte, [][]symbol.Def) {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 	metas := make([]FileMeta, 0, len(ix.byPath))
 	contents := make([][]byte, 0, len(ix.byPath))
+	defs := make([][]symbol.Def, 0, len(ix.byPath))
 	for _, f := range ix.files {
 		if !f.dead {
 			metas = append(metas, f.meta)
 			contents = append(contents, f.content)
+			defs = append(defs, f.defs)
 		}
 	}
-	return metas, contents
+	return metas, contents, defs
+}
+
+// DefHit is one symbol definition hit with its file and source line.
+type DefHit struct {
+	Path string
+	Def  symbol.Def
+	Text string // the definition's source line
+}
+
+// Defs returns definitions whose name equals name (case-folded if fold).
+// PathMatch optionally restricts files. Linear over per-file def lists:
+// ~20 defs/file × tens of thousands of files stays in single-digit ms.
+func (ix *Index) Defs(name string, fold bool, pathMatch func(string) bool) []DefHit {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	want := name
+	if fold {
+		want = strings.ToLower(name)
+	}
+	var hits []DefHit
+	for _, f := range ix.files {
+		if f.dead || len(f.defs) == 0 {
+			continue
+		}
+		if pathMatch != nil && !pathMatch(f.meta.Path) {
+			continue
+		}
+		for _, d := range f.defs {
+			got := d.Name
+			if fold {
+				got = strings.ToLower(got)
+			}
+			if got == want {
+				hits = append(hits, DefHit{Path: f.meta.Path, Def: d, Text: LineText(f.content, d.Line)})
+			}
+		}
+	}
+	return hits
+}
+
+// FileDefs returns all definitions in one file.
+func (ix *Index) FileDefs(path string) ([]DefHit, bool) {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	id, ok := ix.byPath[path]
+	if !ok {
+		return nil, false
+	}
+	f := ix.files[id]
+	hits := make([]DefHit, 0, len(f.defs))
+	for _, d := range f.defs {
+		hits = append(hits, DefHit{Path: path, Def: d, Text: LineText(f.content, d.Line)})
+	}
+	return hits, true
+}
+
+// FileContent is a read-only view of an indexed file.
+type FileContent struct {
+	Path    string
+	Content []byte
+}
+
+// FilesContaining returns files whose content contains lit (exact bytes),
+// pruned via the trigram index. Contents are shared: do not mutate.
+func (ix *Index) FilesContaining(lit string, pathMatch func(string) bool) []FileContent {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	needle := []byte(lit)
+	var out []FileContent
+	for _, id := range ix.candidatesLocked(strings.ToLower(lit)) {
+		f := ix.files[id]
+		if f.dead || pathMatch != nil && !pathMatch(f.meta.Path) {
+			continue
+		}
+		if bytes.Contains(f.content, needle) {
+			out = append(out, FileContent{Path: f.meta.Path, Content: f.content})
+		}
+	}
+	return out
+}
+
+// LineText returns the 1-based line of content (without newline).
+func LineText(content []byte, line int) string {
+	start := 0
+	for n := 1; n < line; n++ {
+		i := bytes.IndexByte(content[start:], '\n')
+		if i < 0 {
+			return ""
+		}
+		start += i + 1
+	}
+	end := bytes.IndexByte(content[start:], '\n')
+	if end < 0 {
+		return string(content[start:])
+	}
+	return string(content[start : start+end])
 }
 
 type Match struct {

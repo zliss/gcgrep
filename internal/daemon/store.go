@@ -19,6 +19,7 @@ import (
 
 	"github.com/zliss/gcgrep/internal/ignore"
 	"github.com/zliss/gcgrep/internal/index"
+	"github.com/zliss/gcgrep/internal/symbol"
 	"github.com/zliss/gcgrep/internal/watch"
 )
 
@@ -401,9 +402,12 @@ type persisted struct {
 	Root     string
 	Metas    []index.FileMeta
 	Contents [][]byte
+	Defs     [][]symbol.Def
 }
 
-const persistVersion = "1"
+// persistVersion 2: added symbol definitions. Older files are discarded
+// and rebuilt by a full scan.
+const persistVersion = "2"
 
 func (s *RootStore) indexPath() string {
 	sum := sha256.Sum256([]byte(s.root))
@@ -433,7 +437,7 @@ func (s *RootStore) loadPersisted() *index.Index {
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				idx.AddWithKeys(p.Metas[i], p.Contents[i], index.TrigramKeys(p.Contents[i]))
+				idx.AddWithKeys(p.Metas[i], p.Contents[i], index.TrigramKeys(p.Contents[i]), p.Defs[i])
 			}
 		}()
 	}
@@ -456,8 +460,8 @@ func (s *RootStore) scheduleSave() {
 }
 
 func (s *RootStore) save() {
-	metas, contents := s.idx.Snapshot()
-	p := persisted{Version: persistVersion, Root: s.root, Metas: metas, Contents: contents}
+	metas, contents, defs := s.idx.Snapshot()
+	p := persisted{Version: persistVersion, Root: s.root, Metas: metas, Contents: contents, Defs: defs}
 	tmp := s.indexPath() + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {

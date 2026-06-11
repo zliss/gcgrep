@@ -1,73 +1,114 @@
 # gcgrep
 
-Indexed, grep-like code search. The first search of a directory builds an
-in-memory trigram index held by a resident daemon; file changes are watched
-and applied incrementally (like an IDE), so every later search answers in
-milliseconds — no per-search filesystem scan, which is what makes `grep -r`
-slow and CPU-hungry, especially on Windows 11 (NTFS + Defender real-time
-scanning of every opened file).
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)](go.mod)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)]()
 
-- **Fast** (kubernetes/kubernetes, 30k files): warm literal query 5 ms on
-  macOS / 37 ms on Win11 end to end, vs `grep -r` 0.26 s (macOS) and
-  `findstr /s` 1.8 s / `Select-String` 9.4 s (Win11). One-time cold index:
-  8 s (macOS) / 55 s (Win11, Defender-bound); daemon restart reloads the
-  persisted index in a fraction of that.
-- **Live**: file create/modify/delete is picked up automatically.
-- **Read-after-write consistent**: a search issued right after a file write
-  is guaranteed to observe it (watchman-style cookie barrier; measured
-  overhead ~1 ms). Safe for edit-then-verify loops; `--no-sync` opts out.
-- **Restart-safe**: indexes persist to disk; on daemon restart a stat-only
-  reconcile pass catches everything that changed while it was down.
-- **No ports**: client and daemon talk over a unix domain socket (macOS,
-  Linux) or named pipe (Windows). Nothing listens on TCP.
-- **Zero config**: respects the root `.gitignore`, always skips `.git`,
-  binaries and files > 2 MB.
+**Indexed, IDE-grade code search with a grep-compatible CLI.** Built for AI
+coding agents and humans tired of slow `grep -r` — especially on Windows 11,
+where NTFS and Defender real-time scanning make every full-tree search
+painful.
 
-Supported: macOS (arm64), Windows 11 (amd64). Linux builds and passes tests
-but is not a release target yet.
+The first search of a directory builds an in-memory trigram + symbol index
+held by a resident daemon. File changes are watched and applied
+incrementally (like an IDE), so every later search answers in milliseconds
+without touching the filesystem.
+
+```text
+$ gcgrep def NewSchedulerCommand ./kubernetes
+cmd/kube-scheduler/app/server.go:93: [func NewSchedulerCommand] func NewSchedulerCommand(registryOptions ...Option) *cobra.Command {
+
+$ gcgrep refs NewSchedulerCommand ./kubernetes
+cmd/kube-scheduler/scheduler.go:30: [call] command := app.NewSchedulerCommand()
+...
+
+$ gcgrep 'leaderelection' ./kubernetes     # plain grep, but 5ms warm
+```
+
+## Why
+
+| kubernetes/kubernetes, 30k files | macOS | Windows 11 |
+|---|---|---|
+| `grep -rn` / `findstr /s` | 260 ms | 1.8 s |
+| PowerShell `Select-String` | — | 9.4 s |
+| **gcgrep (warm)** | **5 ms** | **37 ms** |
+| gcgrep `refs` (warm) | 6 ms | 55 ms |
+| one-time cold index | 8 s | 55 s |
+
+## Features
+
+- **grep-compatible text search**: regex, `-i`, `-F`, `-l`, `-c`, `-g GLOB`,
+  `file:line:text` output, grep exit codes. Drop-in for most workflows.
+- **Symbol search** (Go, Java, Python, TypeScript/JavaScript):
+  - `gcgrep def NAME` — find class/struct/interface/enum/func/method
+    definitions (Go via the real parser; others ctags-grade heuristics)
+  - `gcgrep refs NAME` — candidate references and call sites, comment- and
+    string-aware
+  - `gcgrep symbols FILE` — outline of one file
+- **Live index**: file create/modify/delete applied automatically
+  (debounced watcher; event-overflow falls back to a reconcile scan).
+- **Read-after-write consistency**: a search issued right after a file
+  write is guaranteed to observe it (watchman-style cookie barrier, ~1 ms
+  overhead). Safe for AI edit-then-verify loops. `--no-sync` opts out.
+- **Restart-safe**: indexes persist; restart does a stat-only reconcile
+  that also catches changes made while the daemon was down.
+- **No ports**: unix domain socket (macOS/Linux) / named pipe (Windows).
+- **Zero config**: respects root `.gitignore`; always skips `.git`,
+  binaries, files > 2 MB.
 
 ## Install
 
-Download a release binary and put it on your `PATH`, or build from source:
+Download a binary from [Releases](https://github.com/zliss/gcgrep/releases)
+and put it on your `PATH`, or build from source:
 
 ```sh
 go build -o gcgrep ./cmd/gcgrep
 ```
 
-No service registration is needed: the daemon starts on first use.
+No service setup: the daemon auto-starts on first use and persists across
+sessions. `gcgrep stop` shuts it down (indexes are saved).
 
 ## Usage
 
 ```text
-gcgrep [options] PATTERN [PATH]   search PATH (default .) for regex PATTERN
-gcgrep status                     show daemon state and indexed roots
-gcgrep stop                       stop the daemon (indexes are persisted)
+gcgrep [options] PATTERN [PATH]   text search (regex) under PATH (default .)
+gcgrep def [-i] NAME [PATH]       find symbol definitions
+gcgrep refs NAME [PATH]           find candidate references/calls
+gcgrep symbols FILE               list definitions in FILE
+gcgrep status | stop | daemon
 
--i          case-insensitive
--F          fixed string instead of regex
--l          file names only
--c          per-file match counts
--g GLOB     only files matching GLOB (repeatable)
---json      machine-readable JSON-lines output
---limit N   stop after N lines (default 2000, 0 = unlimited)
+-i           case-insensitive        -F           fixed string
+-l           file names only         -c           per-file match counts
+-g GLOB      filter files            --json       JSON-lines output
+--limit N    cap output (2000)       --no-sync    skip write barrier
 ```
 
-Output is `file:line:text`, exit codes follow grep (0 match, 1 no match,
-2 error). The first search of a directory streams indexing progress to
-stderr; subsequent searches are served from the live index.
+Exit codes follow grep: `0` match, `1` no match, `2` error. First search of
+a directory streams indexing progress to stderr.
+
+### Honest limits
+
+- `refs` is **syntax-level**: it cannot distinguish overloads or same-named
+  methods of unrelated types (that requires type resolution — IDE/LSP
+  territory). It is a high-recall candidate list, comment/string-filtered.
+- Symbol extraction for Java/Python/TS is ctags-grade heuristics; Go uses
+  the real parser. Other languages get text search only.
+- Root `.gitignore` only; `!negation` rules are ignored conservatively.
+- Memory: file contents live in RAM (~1.5× source size; k8s ≈ 700 MB).
 
 ## For AI assistants
 
-Paste this into your agent instructions (e.g. `CLAUDE.md`) after installing:
+Paste into your agent instructions (e.g. `CLAUDE.md`):
 
 ```markdown
-- Use `gcgrep PATTERN [DIR]` instead of grep/rg for code search: it is
-  index-backed and much faster on repeated searches. Output format and exit
-  codes match grep (`file:line:text`). Flags: -i, -F, -l, -c, -g GLOB,
-  --json, --limit N. The first search of a directory builds the index
-  (one-time, progress on stderr); the index then stays current automatically.
-  Searching immediately after editing files is safe: results are
-  read-after-write consistent.
+- Prefer `gcgrep` over grep/rg for code search (falls back to grep if not
+  installed). Same output format and exit codes. Fast after first use.
+  - text: `gcgrep PATTERN [DIR]` (flags: -i -F -l -c -g --json --limit)
+  - find definition: `gcgrep def NAME [DIR]`
+  - find usages/calls (candidates): `gcgrep refs NAME [DIR]`
+  - file outline: `gcgrep symbols FILE`
+  Searching immediately after editing files is safe (read-after-write
+  consistent). First search of a directory builds the index once.
 ```
 
 ## How it works
@@ -75,29 +116,35 @@ Paste this into your agent instructions (e.g. `CLAUDE.md`) after installing:
 ```mermaid
 flowchart LR
     CLI[gcgrep CLI] -- "unix socket / named pipe (JSON lines)" --> D[daemon]
-    D --> IX["trigram index + file contents (in memory)"]
+    D --> IX["trigram + symbol index, file contents (in memory)"]
     W[fsnotify watcher] -- "debounced changes" --> IX
+    CB[cookie barrier] -. "read-after-write sync" .-> W
     IX -- "persist (gob+gzip)" --> C[(cache dir)]
     C -- "load + stat-only reconcile on restart" --> IX
 ```
 
-Queries extract a required literal from the regex, intersect its trigram
-posting lists to get candidate files, then confirm with the real regex over
-in-memory contents. Watcher event-buffer overflow (e.g. a huge `git
-checkout`) triggers a full reconcile rather than trusting the event stream.
+Text queries extract a required literal from the regex, intersect trigram
+posting lists for candidates, then confirm with the regex (or a direct
+`bytes.Index` fast path for plain literals) over in-memory contents.
+Symbols are extracted at index time (Go: stdlib AST; Java/Python/TS:
+comment/string stripping + lexical heuristics) and stored per file.
 
 State lives in the user cache dir (`~/Library/Caches/gcgrep`,
-`%LOCALAPPDATA%\gcgrep`, `~/.cache/gcgrep`): index files, daemon log,
-socket.
+`%LOCALAPPDATA%\gcgrep`, `~/.cache/gcgrep`).
 
 ## Development
 
-`scripts/vmbuild.sh` syncs to a Linux build host, runs gofmt/vet/tests and
-cross-compiles binaries + test binaries for all platforms into `dist/`;
-`scripts/win_test.ps1` runs the unit and end-to-end suite on a Windows
-machine. Tests cover index correctness, gitignore matching, live watching,
-persistence and offline-change reconciliation.
+```sh
+go test ./...        # unit + integration tests (index, watch, barrier, symbols)
+scripts/vmbuild.sh   # fmt/vet/test + cross-compile all platforms (on a Linux host)
+```
+
+CI-grade coverage includes: trigram correctness, gitignore matching, live
+watching, persistence + offline-change reconciliation, a no-sleep
+read-after-write hammer test, and per-language symbol extraction suites.
+Contributions welcome — adding a language = one extractor file + tests
+(see `internal/symbol/`).
 
 ## License
 
-MIT
+[MIT](LICENSE)

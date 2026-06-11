@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/zliss/gcgrep/internal/daemon"
@@ -34,6 +35,8 @@ func run() int {
 	args := os.Args[1:]
 	if len(args) > 0 {
 		switch args[0] {
+		case "def", "refs", "symbols":
+			return cmdSymbol(args[0], args[1:])
 		case "daemon":
 			return cmdDaemon()
 		case "stop":
@@ -56,9 +59,16 @@ func usage() {
 
 Usage:
   gcgrep [options] PATTERN [PATH]   search PATH (default .) for regex PATTERN
+  gcgrep def [-i] NAME [PATH]       find symbol definitions (class/func/method)
+  gcgrep refs NAME [PATH]           find candidate references/calls by name
+  gcgrep symbols FILE               list all definitions in FILE
   gcgrep status                     show daemon state and indexed roots
   gcgrep stop                       stop the daemon (indexes are persisted)
   gcgrep daemon                     run the daemon in the foreground
+
+Symbol support: Go, Java, Python, TypeScript/JavaScript. Definitions are
+parser/ctags-grade; refs are syntax-level candidates by name (overloads
+and same-named members of other types are not distinguished).
 
 Options:
   -i            case-insensitive search
@@ -157,6 +167,56 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return fmt.Sprint([]string(*m)) }
 func (m *multiFlag) Set(s string) error { *m = append(*m, s); return nil }
 
+// cmdSymbol handles def/refs/symbols. For symbols the positional argument
+// is a file; its parent directory becomes the search root.
+func cmdSymbol(op string, args []string) int {
+	var o cliOpts
+	var err error
+	if op == "symbols" {
+		o, err = parseSymbolsFile(args)
+	} else {
+		o, err = parseArgs(args)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gcgrep:", err)
+		return 2
+	}
+	o.req.Op = op
+	conn, cerr := connectOrSpawn()
+	if cerr != nil {
+		fmt.Fprintln(os.Stderr, "gcgrep:", cerr)
+		return 2
+	}
+	defer conn.Close()
+	return streamSearch(conn, o)
+}
+
+func parseSymbolsFile(args []string) (cliOpts, error) {
+	o := cliOpts{}
+	if len(args) != 1 {
+		return o, fmt.Errorf("expected FILE")
+	}
+	abs, err := filepath.Abs(args[0])
+	if err != nil {
+		return o, err
+	}
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		abs = resolved
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return o, err
+	}
+	if fi.IsDir() {
+		return o, fmt.Errorf("FILE must be a file: %s", args[0])
+	}
+	o.req.Root = filepath.Dir(abs)
+	o.req.Pattern = filepath.Base(abs)
+	o.req.Limit = 0
+	o.pathArg = "."
+	return o, nil
+}
+
 func cmdSearch(args []string) int {
 	o, err := parseArgs(args)
 	if err != nil {
@@ -213,7 +273,17 @@ func streamSearch(conn net.Conn, o cliOpts) int {
 			progressShown = true
 		case "match":
 			clearProgress(&progressShown)
-			fmt.Fprintf(out, "%s%s:%d:%s\n", prefix, ev.File, ev.Line, ev.Text)
+			if ev.Kind != "" {
+				qual := ev.Kind
+				if ev.Container != "" {
+					qual += " " + ev.Container + "." + ev.Name
+				} else if ev.Name != "" && ev.Kind != "call" && ev.Kind != "ref" {
+					qual += " " + ev.Name
+				}
+				fmt.Fprintf(out, "%s%s:%d: [%s] %s\n", prefix, ev.File, ev.Line, qual, strings.TrimSpace(ev.Text))
+			} else {
+				fmt.Fprintf(out, "%s%s:%d:%s\n", prefix, ev.File, ev.Line, ev.Text)
+			}
 			matched = true
 		case "filecount":
 			clearProgress(&progressShown)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/zliss/gcgrep/internal/index"
+	"github.com/zliss/gcgrep/internal/symbol"
 )
 
 // waitTimeout exceeds 5s deliberately: watcher debounce is 200ms but CI
@@ -212,5 +213,53 @@ func TestReadAfterWriteBarrier(t *testing.T) {
 		if isCookie(p) {
 			t.Fatalf("cookie file leaked into index: %s", p)
 		}
+	}
+}
+
+func TestSymbolDefsAndRefs(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "svc.go"), `package p
+
+type UserService struct{}
+
+func (s *UserService) GetUser(id int) int { return id }
+func caller() { s := &UserService{}; _ = s.GetUser(1) }
+`)
+	write(t, filepath.Join(root, "Svc.java"), `public class OrderService {
+    public void getUser(long id) { helper(); }
+    private void helper() {}
+}
+`)
+	s := newStore(t, root)
+	defer s.Close()
+
+	defs := s.idx.Defs("GetUser", false, nil)
+	if len(defs) != 1 || defs[0].Path != "svc.go" || defs[0].Def.Container != "UserService" {
+		t.Fatalf("go def wrong: %+v", defs)
+	}
+	// case-insensitive crosses languages
+	all := s.idx.Defs("getuser", true, nil)
+	if len(all) != 2 {
+		t.Fatalf("want 2 case-folded defs, got %+v", all)
+	}
+	fd, ok := s.idx.FileDefs("Svc.java")
+	if !ok || len(fd) != 3 {
+		t.Fatalf("java file defs: ok=%v %+v", ok, fd)
+	}
+	// refs candidates exclude the definition line
+	files := s.idx.FilesContaining("GetUser", nil)
+	refs := 0
+	for _, fc := range files {
+		refs += len(symbol.Refs(fc.Path, fc.Content, "GetUser"))
+	}
+	if refs != 1 {
+		t.Fatalf("want 1 GetUser ref (the call in caller()), got %d", refs)
+	}
+
+	// live update: new file's symbols appear without restart
+	write(t, filepath.Join(root, "extra.py"), "class ExtraService:\n    def get_user(self):\n        pass\n")
+	s.Barrier(waitTimeout)
+	if d := s.idx.Defs("ExtraService", false, nil); len(d) != 1 {
+		t.Fatalf("python def not live-indexed: %+v", d)
 	}
 }

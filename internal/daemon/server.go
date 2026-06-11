@@ -20,6 +20,7 @@ import (
 
 	"github.com/zliss/gcgrep/internal/index"
 	"github.com/zliss/gcgrep/internal/proto"
+	"github.com/zliss/gcgrep/internal/symbol"
 )
 
 const (
@@ -126,6 +127,8 @@ func (sv *Server) handle(conn net.Conn) {
 	switch req.Op {
 	case "search":
 		sv.handleSearch(req, send)
+	case "def", "refs", "symbols":
+		sv.handleSymbol(req, send)
 	case "status":
 		sv.handleStatus(send)
 	case "stop":
@@ -154,25 +157,9 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 		_ = send(proto.Event{Type: "error", Msg: "bad pattern: " + err.Error()})
 		return
 	}
-	s, err := sv.store(req.Root)
-	if err != nil {
-		_ = send(proto.Event{Type: "error", Msg: err.Error()})
+	s, subPrefix, ok := sv.prologue(req, send)
+	if !ok {
 		return
-	}
-	if !streamUntilReady(s, send) {
-		return // client went away during indexing
-	}
-	if !req.NoSync {
-		// read-after-write consistency: searches observe all writes that
-		// happened before the request (cookie-file barrier, watchman-style)
-		s.Barrier(barrierTimeout)
-	}
-
-	// the store may cover an ancestor of the requested path: restrict to
-	// the requested subtree and report paths relative to it
-	subPrefix := ""
-	if rel, rerr := filepath.Rel(s.root, req.Root); rerr == nil && rel != "." {
-		subPrefix = filepath.ToSlash(rel) + "/"
 	}
 	strip := func(p string) string { return strings.TrimPrefix(p, subPrefix) }
 
@@ -244,6 +231,100 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 	}
 	_ = send(proto.Event{Type: "done", Matches: total, FileHits: len(res.FileCounts),
 		DurMS: time.Since(start).Milliseconds(), Truncated: res.Truncated})
+}
+
+// prologue resolves the store for req.Root, waits for readiness streaming
+// progress, and applies the read-after-write barrier. Returns the store
+// and the subtree prefix ("" when req.Root is the store root), or ok=false
+// if an error was already sent / the client left.
+func (sv *Server) prologue(req proto.Request, send func(proto.Event) error) (s *RootStore, subPrefix string, ok bool) {
+	s, err := sv.store(req.Root)
+	if err != nil {
+		_ = send(proto.Event{Type: "error", Msg: err.Error()})
+		return nil, "", false
+	}
+	if !streamUntilReady(s, send) {
+		return nil, "", false
+	}
+	if !req.NoSync {
+		s.Barrier(barrierTimeout)
+	}
+	if rel, rerr := filepath.Rel(s.root, req.Root); rerr == nil && rel != "." {
+		subPrefix = filepath.ToSlash(rel) + "/"
+	}
+	return s, subPrefix, true
+}
+
+// handleSymbol serves def (find definitions by name), refs (candidate
+// references by name) and symbols (all definitions in one file).
+func (sv *Server) handleSymbol(req proto.Request, send func(proto.Event) error) {
+	start := time.Now()
+	s, subPrefix, ok := sv.prologue(req, send)
+	if !ok {
+		return
+	}
+	strip := func(p string) string { return strings.TrimPrefix(p, subPrefix) }
+	inSubtree := func(p string) bool { return subPrefix == "" || strings.HasPrefix(p, subPrefix) }
+
+	emit := 0
+	send1 := func(ev proto.Event) bool {
+		emit++
+		return send(ev) == nil
+	}
+	switch req.Op {
+	case "def":
+		hits := s.idx.Defs(req.Pattern, req.NoCase, inSubtree)
+		sortDefHits(hits)
+		for _, h := range hits {
+			if !send1(proto.Event{Type: "match", File: strip(h.Path), Line: h.Def.Line,
+				Text: h.Text, Kind: string(h.Def.Kind), Container: h.Def.Container, Name: h.Def.Name}) {
+				return
+			}
+		}
+	case "symbols":
+		rel := filepath.ToSlash(filepath.Clean(req.Pattern))
+		hits, found := s.idx.FileDefs(subPrefix + rel)
+		if !found {
+			_ = send(proto.Event{Type: "error", Msg: "file not indexed: " + req.Pattern})
+			return
+		}
+		for _, h := range hits {
+			if !send1(proto.Event{Type: "match", File: strip(h.Path), Line: h.Def.Line,
+				Text: h.Text, Kind: string(h.Def.Kind), Container: h.Def.Container, Name: h.Def.Name}) {
+				return
+			}
+		}
+	case "refs":
+		files := s.idx.FilesContaining(req.Pattern, inSubtree)
+		sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+		for _, fc := range files {
+			for _, r := range symbol.Refs(fc.Path, fc.Content, req.Pattern) {
+				kind := "ref"
+				if r.IsCall {
+					kind = "call"
+				}
+				if !send1(proto.Event{Type: "match", File: strip(fc.Path), Line: r.Line,
+					Text: index.LineText(fc.Content, r.Line), Kind: kind, Name: req.Pattern}) {
+					return
+				}
+				if req.Limit > 0 && emit >= req.Limit {
+					_ = send(proto.Event{Type: "done", Matches: emit, DurMS: time.Since(start).Milliseconds(), Truncated: true})
+					return
+				}
+			}
+		}
+	}
+	_ = send(proto.Event{Type: "done", Matches: emit, DurMS: time.Since(start).Milliseconds()})
+}
+
+func sortDefHits(hits []index.DefHit) {
+	sort.Slice(hits, func(i, j int) bool {
+		a, b := hits[i], hits[j]
+		if a.Path != b.Path {
+			return a.Path < b.Path
+		}
+		return a.Def.Line < b.Def.Line
+	})
 }
 
 // streamUntilReady emits progress events while the initial scan runs.
