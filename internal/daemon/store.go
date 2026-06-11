@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,9 @@ type RootStore struct {
 	saveTimer *time.Timer
 	cacheDir  string
 	closed    chan struct{}
+
+	barrierMu sync.Mutex
+	cookieSeq atomic.Int64
 }
 
 // newRootStore loads any persisted index, starts the watcher BEFORE the
@@ -145,7 +149,7 @@ func (s *RootStore) listFiles() []fileStat {
 			}
 			return nil
 		}
-		if !d.Type().IsRegular() || s.ign.Ignored(rel, false) {
+		if !d.Type().IsRegular() || s.ign.Ignored(rel, false) || isCookie(rel) {
 			return nil
 		}
 		fi, ierr := d.Info()
@@ -239,6 +243,14 @@ func (s *RootStore) indexFile(rel string) {
 	s.idx.Add(index.FileMeta{Path: rel, Size: fi.Size(), MtimeNS: fi.ModTime().UnixNano()}, content)
 }
 
+func isCookie(rel string) bool {
+	base := rel
+	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
+		base = rel[i+1:]
+	}
+	return strings.HasPrefix(base, watch.CookiePrefix)
+}
+
 func isBinary(content []byte) bool {
 	n := len(content)
 	if n > 8192 {
@@ -254,14 +266,64 @@ func (s *RootStore) watchLoop() {
 		if batch.Rescan {
 			log.Printf("watch overflow on %s: reconciling", s.root)
 			s.reconcile()
+		} else {
+			for _, abs := range batch.Paths {
+				s.applyChange(abs)
+			}
+		}
+		if len(batch.Paths) > 0 || batch.Rescan {
 			s.scheduleSave()
-			continue
 		}
-		for _, abs := range batch.Paths {
-			s.applyChange(abs)
+		if batch.Done != nil {
+			close(batch.Done)
 		}
-		s.scheduleSave()
 	}
+}
+
+// Barrier guarantees read-after-write consistency: a search issued after a
+// file write observes that write. It drops a cookie file into the root and
+// waits for its create event — proof that the OS queue up to the write has
+// been drained — then synchronously flushes and applies the debounce queue.
+// On an unwritable root it degrades to flushing already-delivered events.
+func (s *RootStore) Barrier(timeout time.Duration) {
+	if s.State() != StateReady {
+		return // initial scan / reconcile reads current disk state anyway
+	}
+	s.barrierMu.Lock()
+	defer s.barrierMu.Unlock()
+	// drain cookies left over from timed-out barriers
+	for {
+		select {
+		case <-s.watcher.Cookies():
+			continue
+		default:
+		}
+		break
+	}
+	name := fmt.Sprintf("%s%d-%d", watch.CookiePrefix, os.Getpid(), s.cookieSeq.Add(1))
+	path := filepath.Join(s.root, name)
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		s.watcher.Flush(timeout)
+		return
+	}
+	defer os.Remove(path)
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+wait:
+	for {
+		select {
+		case got := <-s.watcher.Cookies():
+			if got == name {
+				break wait
+			}
+		case <-deadline.C:
+			log.Printf("barrier cookie timeout on %s", s.root)
+			break wait
+		case <-s.closed:
+			return
+		}
+	}
+	s.watcher.Flush(timeout)
 }
 
 func (s *RootStore) applyChange(abs string) {
@@ -270,6 +332,9 @@ func (s *RootStore) applyChange(abs string) {
 		return
 	}
 	rel = filepath.ToSlash(rel)
+	if isCookie(rel) {
+		return
+	}
 	if rel == "." || rel == ".gitignore" {
 		// changed ignore rules require a reload + reconcile to apply
 		if rel == ".gitignore" {

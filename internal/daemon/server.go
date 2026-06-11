@@ -22,7 +22,10 @@ import (
 	"github.com/zliss/gcgrep/internal/proto"
 )
 
-const progressInterval = 300 * time.Millisecond
+const (
+	progressInterval = 300 * time.Millisecond
+	barrierTimeout   = 2 * time.Second
+)
 
 type Server struct {
 	mu       sync.Mutex
@@ -158,6 +161,11 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 	}
 	if !streamUntilReady(s, send) {
 		return // client went away during indexing
+	}
+	if !req.NoSync {
+		// read-after-write consistency: searches observe all writes that
+		// happened before the request (cookie-file barrier, watchman-style)
+		s.Barrier(barrierTimeout)
 	}
 
 	// the store may cover an ancestor of the requested path: restrict to

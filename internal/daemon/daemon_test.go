@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -168,5 +169,48 @@ func TestGitignoreRespected(t *testing.T) {
 	waitFor(t, "visible new file", func() bool { return len(hits(s, "lateVisibleNeedle")) == 1 })
 	if len(hits(s, "lateIgnoredNeedle")) != 0 {
 		t.Error("watcher indexed content in ignored dir")
+	}
+}
+
+// TestReadAfterWriteBarrier hammers the exact AI-agent workflow: write a
+// file and search immediately, with NO sleeps between. Without the cookie
+// barrier this flakes within a few iterations (debounce window = 200ms).
+func TestReadAfterWriteBarrier(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "w.go"), "iteration0marker\n")
+	s := newStore(t, root)
+	defer s.Close()
+
+	const rounds = 25
+	for i := 1; i <= rounds; i++ {
+		needle := fmt.Sprintf("iteration%dmarker", i)
+		write(t, filepath.Join(root, "w.go"), needle+"\n")
+		s.Barrier(waitTimeout)
+		if got := hits(s, needle); len(got) != 1 {
+			t.Fatalf("round %d: write not visible after barrier: %+v", i, got)
+		}
+		if stale := hits(s, fmt.Sprintf("iteration%dmarker", i-1)); len(stale) != 0 {
+			t.Fatalf("round %d: stale content visible after barrier", i)
+		}
+	}
+	// new file + immediate search
+	write(t, filepath.Join(root, "fresh.go"), "freshFileMarker\n")
+	s.Barrier(waitTimeout)
+	if got := hits(s, "freshFileMarker"); len(got) != 1 {
+		t.Fatal("new file not visible after barrier")
+	}
+	// delete + immediate search
+	if err := os.Remove(filepath.Join(root, "fresh.go")); err != nil {
+		t.Fatal(err)
+	}
+	s.Barrier(waitTimeout)
+	if got := hits(s, "freshFileMarker"); len(got) != 0 {
+		t.Fatal("deleted file still visible after barrier")
+	}
+	// cookie files must never enter the index
+	for _, p := range s.idx.Paths() {
+		if isCookie(p) {
+			t.Fatalf("cookie file leaked into index: %s", p)
+		}
 	}
 }

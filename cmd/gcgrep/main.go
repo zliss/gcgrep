@@ -68,6 +68,8 @@ Options:
   -g GLOB       only search files matching GLOB (repeatable)
   --json        output one JSON object per event (machine-readable)
   --limit N     stop after N matching lines (default 2000, 0 = no limit)
+  --no-sync     skip the read-after-write barrier (faster, may miss writes
+                made in the last fraction of a second)
 
 First search of a directory builds the index (progress on stderr); later
 searches and file changes are served from the live index.
@@ -115,6 +117,7 @@ func parseArgs(args []string) (cliOpts, error) {
 	fs.Var(&globs, "g", "")
 	fs.BoolVar(&o.jsonOut, "json", false, "")
 	fs.IntVar(&o.req.Limit, "limit", 2000, "")
+	fs.BoolVar(&o.req.NoSync, "no-sync", false, "")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}

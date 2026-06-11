@@ -14,6 +14,7 @@ type Request struct {
 	Count   bool     `json:"count,omitempty"`
 	Globs   []string `json:"globs,omitempty"`
 	Limit   int      `json:"limit,omitempty"`
+	NoSync  bool     `json:"nosync,omitempty"` // skip the read-after-write barrier
 }
 
 // Event.Type values: "progress", "match", "filecount", "done",

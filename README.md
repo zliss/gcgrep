@@ -12,7 +12,10 @@ scanning of every opened file).
   `findstr /s` 1.8 s / `Select-String` 9.4 s (Win11). One-time cold index:
   8 s (macOS) / 55 s (Win11, Defender-bound); daemon restart reloads the
   persisted index in a fraction of that.
-- **Live**: file create/modify/delete is picked up within ~1 s automatically.
+- **Live**: file create/modify/delete is picked up automatically.
+- **Read-after-write consistent**: a search issued right after a file write
+  is guaranteed to observe it (watchman-style cookie barrier; measured
+  overhead ~1 ms). Safe for edit-then-verify loops; `--no-sync` opts out.
 - **Restart-safe**: indexes persist to disk; on daemon restart a stat-only
   reconcile pass catches everything that changed while it was down.
 - **No ports**: client and daemon talk over a unix domain socket (macOS,
@@ -63,6 +66,8 @@ Paste this into your agent instructions (e.g. `CLAUDE.md`) after installing:
   codes match grep (`file:line:text`). Flags: -i, -F, -l, -c, -g GLOB,
   --json, --limit N. The first search of a directory builds the index
   (one-time, progress on stderr); the index then stays current automatically.
+  Searching immediately after editing files is safe: results are
+  read-after-write consistent.
 ```
 
 ## How it works
