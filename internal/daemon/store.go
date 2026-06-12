@@ -20,6 +20,7 @@ import (
 	"github.com/zliss/gcgrep/internal/ignore"
 	"github.com/zliss/gcgrep/internal/index"
 	"github.com/zliss/gcgrep/internal/symbol"
+	"github.com/zliss/gcgrep/internal/walkdir"
 	"github.com/zliss/gcgrep/internal/watch"
 )
 
@@ -30,11 +31,20 @@ const (
 )
 
 // RootStore owns the index, watcher and persistence for one indexed root.
+// follow=true is a separate store variant (rg -L): the walk and the
+// watcher both traverse symlinked directories.
 type RootStore struct {
 	root    string
+	follow  bool
 	idx     *index.Index
 	ign     *ignore.Matcher
 	watcher *watch.Watcher
+
+	// stream is the manifest of searchable-but-not-indexed files
+	// (large/binary/over-budget); see stream.go. In-memory only:
+	// it is rebuilt by the scan/reconcile pass on daemon start.
+	streamMu sync.Mutex
+	stream   map[string]streamEntry
 
 	state   atomic.Value // string
 	indexed atomic.Int64
@@ -61,12 +71,14 @@ type RootStore struct {
 // newRootStore loads any persisted index, starts the watcher BEFORE the
 // reconcile/scan pass (so changes during the pass are not lost), then
 // builds or reconciles in the background.
-func newRootStore(root, cacheDir string, cfg conf.Config) (*RootStore, error) {
+func newRootStore(root, cacheDir string, cfg conf.Config, follow bool) (*RootStore, error) {
 	s := &RootStore{
 		root:     root,
+		follow:   follow,
 		cfg:      cfg,
 		ign:      ignore.Load(root),
 		cacheDir: cacheDir,
+		stream:   make(map[string]streamEntry),
 		ready:    make(chan struct{}),
 		closed:   make(chan struct{}),
 	}
@@ -79,7 +91,7 @@ func newRootStore(root, cacheDir string, cfg conf.Config) (*RootStore, error) {
 		s.state.Store(StateReconciling)
 	}
 
-	w, err := watch.New(root, s.ign.Ignored, cfg.Debounce)
+	w, err := watch.New(root, s.ign.Ignored, cfg.Debounce, follow)
 	if err != nil {
 		return nil, fmt.Errorf("watch %s: %w", root, err)
 	}
@@ -142,26 +154,19 @@ type fileStat struct {
 // walk already produced, so reconcile needs no second stat per file.
 func (s *RootStore) listFiles() []fileStat {
 	var out []fileStat
-	_ = filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
+	_ = walkdir.Walk(s.root, s.follow, func(path string, isDir bool, fi os.FileInfo) error {
 		rel, rerr := filepath.Rel(s.root, path)
 		if rerr != nil || rel == "." {
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
-		if d.IsDir() {
+		if isDir {
 			if s.ign.Ignored(rel, true) {
-				return filepath.SkipDir
+				return fs.SkipDir
 			}
 			return nil
 		}
-		if !d.Type().IsRegular() || s.ign.Ignored(rel, false) || isCookie(rel) {
-			return nil
-		}
-		fi, ierr := d.Info()
-		if ierr != nil {
+		if s.ign.Ignored(rel, false) || isCookie(rel) {
 			return nil
 		}
 		out = append(out, fileStat{rel: rel, size: fi.Size(), mtimeNS: fi.ModTime().UnixNano()})
@@ -215,9 +220,14 @@ func (s *RootStore) reconcile() {
 			s.indexed.Add(1)
 			continue
 		}
+		if e, ok := s.streamGet(f.rel); ok && f.size == e.size && f.mtimeNS == e.mtimeNS {
+			s.indexed.Add(1) // unchanged stream-set file: no re-routing needed
+			continue
+		}
 		stale = append(stale, f.rel)
 	}
 	s.indexParallel(stale)
+	s.streamRetain(onDisk)
 	changed := false
 	for _, p := range s.idx.Paths() {
 		if _, ok := onDisk[p]; !ok {
@@ -230,8 +240,10 @@ func (s *RootStore) reconcile() {
 	}
 }
 
-// indexFile reads and indexes one file; binary or oversized files are
-// removed from the index if present. Read errors (racing deletes) likewise.
+// indexFile reads and indexes one file. Oversized, over-budget and binary
+// files are routed to the stream manifest (searchable via client-side
+// scan) instead of being indexed. Read errors (racing deletes) drop the
+// file from both sets.
 func (s *RootStore) indexFile(rel string) {
 	abs := filepath.Join(s.root, filepath.FromSlash(rel))
 	fi, err := os.Stat(abs)
@@ -242,45 +254,84 @@ func (s *RootStore) indexFile(rel string) {
 		s.removeTracked(rel)
 		return
 	}
-	if fi.Size() > s.cfg.MaxFileSize() {
+	size, mtimeNS := fi.Size(), fi.ModTime().UnixNano()
+	if size > s.cfg.MaxFileSize() {
 		s.skippedLarge.Add(1)
-		s.removeTracked(rel)
+		s.toStream(rel, size, mtimeNS)
 		return
 	}
-	if s.cfg.MaxIndexMB > 0 && s.totalBytes.Load()+fi.Size() > int64(s.cfg.MaxIndexMB)<<20 {
+	if !s.reserveBytes(size) {
 		if s.skippedBudget.Add(1) == 1 {
-			log.Printf("index budget GCGREP_MAX_INDEX_MB=%d reached on %s: further files skipped", s.cfg.MaxIndexMB, s.root)
+			log.Printf("index budget GCGREP_MAX_INDEX_MB=%d reached on %s: further files go to the stream set", s.cfg.MaxIndexMB, s.root)
 		}
-		s.removeTracked(rel)
+		s.toStream(rel, size, mtimeNS)
 		return
 	}
 	content, err := os.ReadFile(abs)
 	if err != nil {
+		s.totalBytes.Add(-size) // release the reservation
 		if !os.IsNotExist(err) {
 			s.skippedError.Add(1)
 		}
 		s.removeTracked(rel)
 		return
 	}
+	if decoded, ok := decodeUTF16(content); ok {
+		content = decoded // UTF-16 with BOM: index the UTF-8 transcoding
+	}
 	if isBinary(content) {
+		s.totalBytes.Add(-size) // release the reservation
 		s.skippedBinary.Add(1)
-		s.removeTracked(rel)
+		s.toStream(rel, size, mtimeNS)
 		return
 	}
 	if old, ok := s.idx.Meta(rel); ok {
 		s.totalBytes.Add(-old.Size)
 	}
-	s.totalBytes.Add(fi.Size())
-	s.idx.Add(index.FileMeta{Path: rel, Size: fi.Size(), MtimeNS: fi.ModTime().UnixNano()}, content)
+	s.streamDelete(rel) // may have shrunk / become text
+	// meta carries the ON-DISK size/mtime (reconcile compares against
+	// stat), even when content is a transcoding of different length;
+	// the byte reservation above already accounts for size
+	s.idx.Add(index.FileMeta{Path: rel, Size: size, MtimeNS: mtimeNS}, content)
 }
 
-// removeTracked removes a file from the index keeping the byte budget
-// accounting consistent.
+// reserveBytes atomically claims n bytes of the per-root index budget.
+// CAS instead of check-then-add: parallel workers racing a plain read
+// would all pass the check and overshoot the budget together.
+func (s *RootStore) reserveBytes(n int64) bool {
+	if s.cfg.MaxIndexMB <= 0 {
+		s.totalBytes.Add(n)
+		return true
+	}
+	budget := int64(s.cfg.MaxIndexMB) << 20
+	for {
+		cur := s.totalBytes.Load()
+		if cur+n > budget {
+			return false
+		}
+		if s.totalBytes.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
+}
+
+// toStream moves a file from the index to the stream manifest.
+func (s *RootStore) toStream(rel string, size, mtimeNS int64) {
+	if old, ok := s.idx.Meta(rel); ok {
+		s.totalBytes.Add(-old.Size)
+	}
+	s.idx.Remove(rel)
+	s.streamPut(rel, size, mtimeNS)
+}
+
+// removeTracked removes a file from index and stream manifest, keeping
+// the byte budget accounting consistent.
 func (s *RootStore) removeTracked(rel string) {
 	if old, ok := s.idx.Meta(rel); ok {
 		s.totalBytes.Add(-old.Size)
 	}
 	s.idx.Remove(rel)
+	s.streamDelete(rel)
 }
 
 func isCookie(rel string) bool {
@@ -391,6 +442,8 @@ func (s *RootStore) applyChange(abs string) {
 		}
 		s.idx.Remove(rel)
 		s.idx.RemovePrefix(rel)
+		s.streamDelete(rel)
+		s.streamDeletePrefix(rel)
 	case fi.IsDir():
 		if s.ign.Ignored(rel, true) {
 			return
@@ -411,22 +464,19 @@ func (s *RootStore) applyChange(abs string) {
 func (s *RootStore) listUnder(relDir string) []string {
 	var out []string
 	base := filepath.Join(s.root, filepath.FromSlash(relDir))
-	_ = filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
+	_ = walkdir.Walk(base, s.follow, func(path string, isDir bool, fi os.FileInfo) error {
 		rel, rerr := filepath.Rel(s.root, path)
 		if rerr != nil {
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
-		if d.IsDir() {
+		if isDir {
 			if rel != relDir && s.ign.Ignored(rel, true) {
-				return filepath.SkipDir
+				return fs.SkipDir
 			}
 			return nil
 		}
-		if d.Type().IsRegular() && !s.ign.Ignored(rel, false) {
+		if !s.ign.Ignored(rel, false) {
 			out = append(out, rel)
 		}
 		return nil
@@ -449,7 +499,11 @@ type persisted struct {
 const persistVersion = "2"
 
 func (s *RootStore) indexPath() string {
-	sum := sha256.Sum256([]byte(s.root))
+	key := s.root
+	if s.follow {
+		key += "\x00follow" // -L variant persists separately
+	}
+	sum := sha256.Sum256([]byte(key))
 	return filepath.Join(s.cacheDir, "index-"+hex.EncodeToString(sum[:8])+".gob.gz")
 }
 

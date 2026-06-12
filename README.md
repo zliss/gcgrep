@@ -65,8 +65,19 @@ with single lines over 2000 chars (minified bundles):
 - **Indexes everything, excludes explicitly**: unlike ripgrep, gcgrep does
   NOT silently honor `.gitignore` — gitignored dirs (Maven dependency
   sources, build output) are often exactly what you want to search.
-  Always skips `.git`, binaries and files > 2 MB; add a `.gcgrepignore`
-  at the root (gitignore syntax) for anything else.
+  Always skips `.git`; add a `.gcgrepignore` at the root (gitignore
+  syntax) for anything else.
+- **Nothing is unsearchable**: files too large to index (> 2 MB default),
+  binary files and files past the RAM budget stay searchable — the daemon
+  tracks them and the client scans them from disk at query time
+  (rg-style), transparently merged into the same output.
+- **rg-aligned filters**: hidden files skipped by default + `--hidden`,
+  binary skipped + `-a/--text`, symlinks not followed + `-L/--follow`
+  (cycle-safe), `--max-filesize 50M`. UTF-16 files are transcoded and
+  indexed as UTF-8.
+- **Resource-restrained**: indexing workers default to min(cores/2, 8)
+  and the daemon runs at low OS priority (`GCGREP_PRIORITY=normal` to
+  opt out) — it never competes with your build.
 - **Long-line aware**: full lines by default (grep/rg parity). With
   `--max-columns N` (or `GCGREP_MAX_COLUMNS`), long lines travel as
   location-only events and the client renders an N-byte window centered
@@ -76,8 +87,8 @@ with single lines over 2000 chars (minified bundles):
   counted in `gcgrep status`), `GCGREP_MAX_INDEX_MB` (per-root RAM
   budget), `GCGREP_BARRIER_TIMEOUT_MS`, `GCGREP_DEBOUNCE_MS`,
   `GCGREP_SAVE_DELAY_MS`, `GCGREP_WORKERS`, `GCGREP_LIMIT`,
-  `GCGREP_MAX_COLUMNS`, `GCGREP_SPAWN_TIMEOUT_MS`, `GCGREP_DIAL_TIMEOUT_MS`.
-  The daemon logs effective overrides at startup.
+  `GCGREP_MAX_COLUMNS`, `GCGREP_SPAWN_TIMEOUT_MS`, `GCGREP_DIAL_TIMEOUT_MS`,
+  `GCGREP_PRIORITY`. The daemon logs effective overrides at startup.
 
 ## Install
 
@@ -104,27 +115,31 @@ gcgrep status | stop | daemon
 -l           file names only         -c           per-file match counts
 -g GLOB      filter files            --json       JSON-lines output
 --limit N    cap output (2000)       --no-sync    skip write barrier
+--hidden     include dot-files       -a, --text   binaries as text
+-L, --follow follow symlinks         --max-filesize SIZE  (e.g. 50M)
 ```
 
 Exit codes follow grep: `0` match, `1` no match, `2` error. First search of
 a directory streams indexing progress to stderr.
 
-### What is NOT indexed (complete list)
+### What is NOT searchable (complete list)
 
 Every skip is counted and visible in `gcgrep status` — nothing is
 silently unsearchable without a number telling you so:
 
 1. `.git` directories (always).
 2. Rules in a root `.gcgrepignore` (yours).
-3. Symlinks — neither file nor directory links are followed (same as
-   rg's default; prevents loops and double-indexing).
-4. Non-regular files (sockets, fifos, devices).
-5. Files larger than `GCGREP_MAX_FILESIZE_MB` (default 2) → counted.
-6. Files beyond the `GCGREP_MAX_INDEX_MB` budget, if set → counted.
-7. Binary files: NUL byte within the first 8 KB → counted. Note this
-   currently also catches UTF-16 encoded text files (a known gap; rg
-   transcodes them, we do not yet).
-8. Unreadable files/dirs (permissions, vanished mid-read) → counted.
+3. Hidden files/dirs by default → use `--hidden` (query-time, no reindex).
+4. Symlinks by default → use `-L/--follow` (cycle-safe; a follow variant
+   keeps its own index).
+5. Non-regular files (sockets, fifos, devices).
+6. Unreadable files/dirs (permissions, vanished mid-read) → counted.
+
+Files larger than `GCGREP_MAX_FILESIZE_MB` (default 2), files beyond the
+`GCGREP_MAX_INDEX_MB` budget and binary files (NUL in the first 8 KB) are
+**not in the index but still searched**: the client scans them from disk
+at query time (binaries only with `-a`). UTF-16 files with a BOM are
+transcoded and indexed as regular text.
 
 ### Honest limits
 

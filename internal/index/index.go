@@ -324,6 +324,10 @@ type SearchOpts struct {
 	// truncation). Minified single-line JSON/XML otherwise produces
 	// multi-KB output lines.
 	MaxColumns int
+
+	// MaxFileSize excludes indexed files larger than this many bytes
+	// (rg --max-filesize); 0 = no limit.
+	MaxFileSize int64
 }
 
 type SearchResult struct {
@@ -341,6 +345,9 @@ func (ix *Index) Search(re *regexp.Regexp, opts SearchOpts) SearchResult {
 	for _, id := range ix.candidatesLocked(opts.Literal) {
 		f := ix.files[id]
 		if f.dead {
+			continue
+		}
+		if opts.MaxFileSize > 0 && f.meta.Size > opts.MaxFileSize {
 			continue
 		}
 		if opts.PathMatch != nil && !opts.PathMatch(f.meta.Path) {

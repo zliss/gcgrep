@@ -26,6 +26,7 @@ type Config struct {
 	MaxColumns       int           // GCGREP_MAX_COLUMNS: default match-line display cap, 0 = unlimited
 	Limit            int           // GCGREP_LIMIT: default match cap, 0 = unlimited
 	ProgressInterval time.Duration // GCGREP_PROGRESS_INTERVAL_MS: indexing progress frequency
+	Priority         string        // GCGREP_PRIORITY: "low" (default) or "normal" daemon process priority
 }
 
 func Default() Config {
@@ -35,13 +36,28 @@ func Default() Config {
 		BarrierTimeout:   2 * time.Second,
 		Debounce:         200 * time.Millisecond,
 		SaveDelay:        30 * time.Second,
-		Workers:          runtime.NumCPU(),
+		Workers:          defaultWorkers(),
 		SpawnTimeout:     5 * time.Second,
 		DialTimeout:      500 * time.Millisecond,
 		MaxColumns:       0,
 		Limit:            2000,
 		ProgressInterval: 300 * time.Millisecond,
+		Priority:         "low",
 	}
+}
+
+// defaultWorkers keeps indexing from saturating the machine: a background
+// helper should never compete with the user's build/IDE for every core.
+func defaultWorkers() int {
+	const maxDefaultWorkers = 8
+	w := runtime.NumCPU() / 2
+	if w > maxDefaultWorkers {
+		w = maxDefaultWorkers
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
 }
 
 // Load returns defaults overridden by GCGREP_* environment variables.
@@ -58,6 +74,9 @@ func Load() Config {
 	intVar(&c.MaxColumns, "GCGREP_MAX_COLUMNS")
 	intVar(&c.Limit, "GCGREP_LIMIT")
 	msVar(&c.ProgressInterval, "GCGREP_PROGRESS_INTERVAL_MS")
+	if v, ok := os.LookupEnv("GCGREP_PRIORITY"); ok && (v == "low" || v == "normal") {
+		c.Priority = v
+	}
 	if c.Workers < 1 {
 		c.Workers = 1
 	}
@@ -71,7 +90,8 @@ func (c Config) MaxFileSize() int64 { return int64(c.MaxFileSizeMB) << 20 }
 func Overrides() []string {
 	keys := []string{"GCGREP_MAX_FILESIZE_MB", "GCGREP_MAX_INDEX_MB", "GCGREP_BARRIER_TIMEOUT_MS",
 		"GCGREP_DEBOUNCE_MS", "GCGREP_SAVE_DELAY_MS", "GCGREP_WORKERS", "GCGREP_SPAWN_TIMEOUT_MS",
-		"GCGREP_DIAL_TIMEOUT_MS", "GCGREP_MAX_COLUMNS", "GCGREP_LIMIT", "GCGREP_PROGRESS_INTERVAL_MS"}
+		"GCGREP_DIAL_TIMEOUT_MS", "GCGREP_MAX_COLUMNS", "GCGREP_LIMIT", "GCGREP_PROGRESS_INTERVAL_MS",
+		"GCGREP_PRIORITY"}
 	var out []string
 	for _, k := range keys {
 		if v, ok := os.LookupEnv(k); ok {

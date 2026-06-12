@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.5.0 (2026-06-12)
+
+ripgrep-alignment release: nothing under a root is silently unsearchable
+anymore.
+
+- **Stream set**: files the daemon does not index (over
+  `GCGREP_MAX_FILESIZE_MB`, binary, over the index budget) are now
+  tracked in a manifest and **searched anyway** — the daemon announces
+  them per query and the client scans them from disk, rg-style. Applies
+  to all modes (`-l`, `-c`, `--json`). `gcgrep status` shows the count.
+- `--hidden`: dot-files/dirs are now skipped by default (rg parity,
+  query-time filter — no reindex when toggling) and included with the
+  flag.
+- `-a/--text`: search binary files as text (client-side NUL probe).
+- `-L/--follow`: follow symlinked files/dirs with cycle protection; a
+  follow variant keeps its own index per root.
+- `--max-filesize SIZE` (K/M/G suffixes): exclude large files per query.
+- UTF-16 files (BOM) are transcoded and indexed as UTF-8 — previously
+  misclassified as binary.
+- Resource restraint: indexing workers default to min(cores/2, 8); the
+  daemon runs at low OS priority (`nice +10` / `BELOW_NORMAL`),
+  `GCGREP_PRIORITY=normal` opts out.
+- Version handshake: client warns when the daemon is an older version
+  (an old daemon silently ignores new flags).
+- Fixed a race where parallel indexing workers could overshoot
+  `GCGREP_MAX_INDEX_MB`.
+
+
 ## v0.4.0 (2026-06-12)
 
 - All hardcoded tunables are now GCGREP_* environment variables:

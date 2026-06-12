@@ -2,7 +2,7 @@
 // Each request and each response event is one JSON object per line.
 package proto
 
-const Version = "0.4.0"
+const Version = "0.5.0"
 
 type Request struct {
 	Op      string   `json:"op"` // "search" | "status" | "stop"
@@ -19,10 +19,17 @@ type Request struct {
 	// -1 = unlimited); protects pipes and AI token budgets from minified
 	// single-line JSON/XML.
 	MaxColumns int `json:"maxcols,omitempty"`
+
+	Hidden bool `json:"hidden,omitempty"` // include dot-files/dirs (rg --hidden)
+	Text   bool `json:"text,omitempty"`   // search binary files as text (rg -a)
+	Follow bool `json:"follow,omitempty"` // follow symlinks (rg -L); selects a follow-variant store
+	// MaxFilesize, in bytes, excludes larger files from the search
+	// (indexed and stream set alike). 0 = no limit (rg --max-filesize).
+	MaxFilesize int64 `json:"maxFilesize,omitempty"`
 }
 
-// Event.Type values: "progress", "match", "filecount", "done",
-// "status", "error".
+// Event.Type values: "progress", "match", "filecount", "streamfile",
+// "done", "status", "error".
 type Event struct {
 	Type string `json:"type"`
 
@@ -31,15 +38,19 @@ type Event struct {
 	Total   int    `json:"total,omitempty"`
 	Stage   string `json:"stage,omitempty"` // "indexing" | "reconciling"
 
-	// match / filecount. For lines longer than max-columns the daemon
-	// omits Text and sends Col (match offset in line) + LineLen instead;
-	// the client re-reads the file to render a window around the hit.
+	// match / filecount / streamfile. For lines longer than max-columns the
+	// daemon omits Text and sends Col (match offset in line) + LineLen
+	// instead; the client re-reads the file to render a window around the
+	// hit. A "streamfile" event names a file the daemon tracks but does not
+	// hold in memory (too large / binary / over budget): the client scans
+	// it from disk after "done" ordering is decided client-side.
 	File    string `json:"file,omitempty"`
 	Line    int    `json:"line,omitempty"`
 	Text    string `json:"text,omitempty"`
 	Count   int    `json:"count,omitempty"`
 	Col     int    `json:"col,omitempty"`
 	LineLen int    `json:"lineLen,omitempty"`
+	Size    int64  `json:"size,omitempty"` // streamfile: on-disk size
 
 	// symbol matches (def / refs / symbols)
 	Name      string `json:"name,omitempty"`
@@ -60,6 +71,11 @@ type Event struct {
 
 	// error
 	Msg string `json:"msg,omitempty"`
+
+	// V is the daemon's protocol version, set on "done" and "status"
+	// events so a client of a different version can warn (an old daemon
+	// silently ignores new request fields like hidden/follow).
+	V string `json:"v,omitempty"`
 }
 
 type RootStatus struct {
@@ -70,6 +86,10 @@ type RootStatus struct {
 	SizeMB        int `json:"sizeMb"`
 	SkippedLarge  int `json:"skippedLarge,omitempty"`  // over GCGREP_MAX_FILESIZE_MB
 	SkippedBudget int `json:"skippedBudget,omitempty"` // over GCGREP_MAX_INDEX_MB
-	SkippedBinary int `json:"skippedBinary,omitempty"` // NUL byte in first 8KB (incl UTF-16)
+	SkippedBinary int `json:"skippedBinary,omitempty"` // NUL byte in first 8KB
 	SkippedError  int `json:"skippedError,omitempty"`  // unreadable: permissions etc.
+	// StreamFiles counts files searchable via client-side disk scan
+	// (large/binary/over-budget files are tracked, not dropped).
+	StreamFiles int  `json:"streamFiles,omitempty"`
+	Follow      bool `json:"follow,omitempty"` // -L variant store
 }
