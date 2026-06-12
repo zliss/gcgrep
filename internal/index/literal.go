@@ -23,19 +23,6 @@ func PlainLiteral(pattern string, fixed bool) (string, bool) {
 	return "", false
 }
 
-// asciiLower lowercases ASCII letters into a fresh buffer, preserving
-// length (multi-byte runes are untouched, so offsets stay valid).
-func asciiLower(b []byte) []byte {
-	out := make([]byte, len(b))
-	for i, c := range b {
-		if c >= 'A' && c <= 'Z' {
-			c += 32
-		}
-		out[i] = c
-	}
-	return out
-}
-
 // HasNonASCII reports whether s contains bytes outside the ASCII range.
 func HasNonASCII(s string) bool {
 	for i := 0; i < len(s); i++ {
@@ -49,13 +36,23 @@ func HasNonASCII(s string) bool {
 // literalFindAll returns match index pairs of lit in content, optionally
 // ASCII-case-folded, mirroring regexp.FindAllIndex's shape.
 func literalFindAll(content, lit []byte, fold bool) [][]int {
-	if fold {
-		content = asciiLower(content)
-		lit = asciiLower(lit)
+	if len(lit) == 0 {
+		return nil
 	}
 	var locs [][]int
+	if !fold {
+		for off := 0; ; {
+			i := bytes.Index(content[off:], lit)
+			if i < 0 {
+				return locs
+			}
+			start := off + i
+			locs = append(locs, []int{start, start + len(lit)})
+			off = start + len(lit)
+		}
+	}
 	for off := 0; ; {
-		i := bytes.Index(content[off:], lit)
+		i := foldIndex(content[off:], lit)
 		if i < 0 {
 			return locs
 		}
@@ -63,4 +60,46 @@ func literalFindAll(content, lit []byte, fold bool) [][]int {
 		locs = append(locs, []int{start, start + len(lit)})
 		off = start + len(lit)
 	}
+}
+
+// foldIndex is an allocation-free ASCII-case-insensitive bytes.Index:
+// SIMD-accelerated IndexByte jumps on both case variants of the first
+// byte, then a folded compare. Copying the haystack to lowercase (the
+// obvious approach) costs a full content-sized allocation per file per
+// query, which dominated -i searches.
+func foldIndex(s, lit []byte) int {
+	c1 := lower(lit[0])
+	c2 := c1
+	if c1 >= 'a' && c1 <= 'z' {
+		c2 = c1 - 32
+	}
+	for off := 0; off+len(lit) <= len(s); {
+		i1 := bytes.IndexByte(s[off:], c1)
+		if c2 != c1 {
+			if i2 := bytes.IndexByte(s[off:], c2); i2 >= 0 && (i1 < 0 || i2 < i1) {
+				i1 = i2
+			}
+		}
+		if i1 < 0 {
+			return -1
+		}
+		pos := off + i1
+		if pos+len(lit) > len(s) {
+			return -1
+		}
+		if foldEqual(s[pos:pos+len(lit)], lit) {
+			return pos
+		}
+		off = pos + 1
+	}
+	return -1
+}
+
+func foldEqual(a, b []byte) bool {
+	for i := range b {
+		if lower(a[i]) != lower(b[i]) {
+			return false
+		}
+	}
+	return true
 }

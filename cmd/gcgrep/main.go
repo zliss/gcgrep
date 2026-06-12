@@ -80,6 +80,8 @@ Options:
   --limit N     stop after N matching lines (default 2000, 0 = no limit)
   --no-sync     skip the read-after-write barrier (faster, may miss writes
                 made in the last fraction of a second)
+  --max-columns N  truncate match lines to N bytes around the hit
+                (default 4096; -1 = unlimited)
 
 First search of a directory builds the index (progress on stderr); later
 searches and file changes are served from the live index.
@@ -128,6 +130,7 @@ func parseArgs(args []string) (cliOpts, error) {
 	fs.BoolVar(&o.jsonOut, "json", false, "")
 	fs.IntVar(&o.req.Limit, "limit", 2000, "")
 	fs.BoolVar(&o.req.NoSync, "no-sync", false, "")
+	fs.IntVar(&o.req.MaxColumns, "max-columns", 0, "")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}

@@ -10,7 +10,7 @@ func matcher(t *testing.T, gitignore string) *Matcher {
 	t.Helper()
 	dir := t.TempDir()
 	if gitignore != "" {
-		if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(gitignore), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, ".gcgrepignore"), []byte(gitignore), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -29,7 +29,7 @@ func TestGitAlwaysIgnored(t *testing.T) {
 	}
 }
 
-func TestGitignorePatterns(t *testing.T) {
+func TestIgnorePatterns(t *testing.T) {
 	m := matcher(t, `
 node_modules/
 *.log

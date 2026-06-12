@@ -3,6 +3,7 @@ package index
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -150,5 +151,45 @@ func TestPlainLiteralFastPath(t *testing.T) {
 	}
 	if lit, ok := PlainLiteral("a.b", true); !ok || lit != "a.b" {
 		t.Fatalf("fixed pattern not literal: %q %v", lit, ok)
+	}
+}
+
+func TestFoldIndexNoAlloc(t *testing.T) {
+	hay := []byte("xxxx LeaderElection yyyy LEADERELECTION zzz leaderelection")
+	locs := literalFindAll(hay, []byte("LeaderElection"), true)
+	if len(locs) != 3 {
+		t.Fatalf("fold find: want 3, got %v", locs)
+	}
+	if locs[0][0] != 5 {
+		t.Fatalf("first match offset = %d, want 5", locs[0][0])
+	}
+	if got := literalFindAll(hay, []byte("zzzz"), true); len(got) != 0 {
+		t.Fatalf("false positive: %v", got)
+	}
+	// needle starting with non-letter
+	if got := literalFindAll([]byte("a_Bc x_bC"), []byte("_bc"), true); len(got) != 2 {
+		t.Fatalf("non-letter first byte: %v", got)
+	}
+}
+
+func TestMaxColumnsTruncation(t *testing.T) {
+	long := strings.Repeat("a", 3000) + "NEEDLE" + strings.Repeat("b", 3000)
+	ix := New("/r")
+	add(ix, "min.json", long+"\n")
+	res := ix.Search(regexp.MustCompile("NEEDLE"), SearchOpts{Literal: "needle", MaxColumns: 200})
+	if len(res.Matches) != 1 {
+		t.Fatalf("match lost: %+v", res.Matches)
+	}
+	text := res.Matches[0].Text
+	if len(text) > 210 {
+		t.Fatalf("not truncated: len=%d", len(text))
+	}
+	if !strings.Contains(text, "NEEDLE") {
+		t.Fatalf("hit not visible in truncated window: %q", text)
+	}
+	// unlimited keeps the full line
+	res = ix.Search(regexp.MustCompile("NEEDLE"), SearchOpts{Literal: "needle"})
+	if len(res.Matches[0].Text) != len(long) {
+		t.Fatal("untruncated line modified")
 	}
 }

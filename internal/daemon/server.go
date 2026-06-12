@@ -26,6 +26,9 @@ import (
 const (
 	progressInterval = 300 * time.Millisecond
 	barrierTimeout   = 2 * time.Second
+	// defaultMaxColumns bounds match-line output; minified one-line JSON
+	// files otherwise emit multi-KB lines per match
+	defaultMaxColumns = 4096
 )
 
 type Server struct {
@@ -118,6 +121,11 @@ func (sv *Server) handle(conn net.Conn) {
 		if err := enc.Encode(ev); err != nil {
 			return err
 		}
+		// flushing per match throttles high-hit queries on named pipes;
+		// matches ride the bufio buffer and flush with the final event
+		if ev.Type == "match" || ev.Type == "filecount" {
+			return nil
+		}
 		return w.Flush()
 	}
 	var req proto.Request
@@ -157,16 +165,24 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 		_ = send(proto.Event{Type: "error", Msg: "bad pattern: " + err.Error()})
 		return
 	}
-	s, subPrefix, ok := sv.prologue(req, send)
+	s, subPrefix, barrierMS, ok := sv.prologue(req, send)
 	if !ok {
 		return
 	}
 	strip := func(p string) string { return strings.TrimPrefix(p, subPrefix) }
 
+	maxCols := req.MaxColumns
+	switch {
+	case maxCols == 0:
+		maxCols = defaultMaxColumns
+	case maxCols < 0:
+		maxCols = 0 // explicit unlimited
+	}
 	opts := index.SearchOpts{
-		Literal:   index.ExtractLiteral(req.Pattern, req.Fixed),
-		FilesOnly: req.Files || req.Count,
-		Limit:     req.Limit,
+		MaxColumns: maxCols,
+		Literal:    index.ExtractLiteral(req.Pattern, req.Fixed),
+		FilesOnly:  req.Files || req.Count,
+		Limit:      req.Limit,
 	}
 	// pure literals skip the regex engine; the ASCII fold fast path is
 	// only safe when the needle itself is ASCII
@@ -193,7 +209,9 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 			return inner == nil || inner(strip(p))
 		}
 	}
+	searchStart := time.Now()
 	res := s.idx.Search(re, opts)
+	searchMS := time.Since(searchStart).Milliseconds()
 
 	switch {
 	case req.Count, req.Files:
@@ -230,36 +248,39 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 		total += c
 	}
 	_ = send(proto.Event{Type: "done", Matches: total, FileHits: len(res.FileCounts),
-		DurMS: time.Since(start).Milliseconds(), Truncated: res.Truncated})
+		DurMS: time.Since(start).Milliseconds(), BarrierMS: barrierMS, SearchMS: searchMS,
+		Truncated: res.Truncated})
 }
 
 // prologue resolves the store for req.Root, waits for readiness streaming
 // progress, and applies the read-after-write barrier. Returns the store
 // and the subtree prefix ("" when req.Root is the store root), or ok=false
 // if an error was already sent / the client left.
-func (sv *Server) prologue(req proto.Request, send func(proto.Event) error) (s *RootStore, subPrefix string, ok bool) {
+func (sv *Server) prologue(req proto.Request, send func(proto.Event) error) (s *RootStore, subPrefix string, barrierMS int64, ok bool) {
 	s, err := sv.store(req.Root)
 	if err != nil {
 		_ = send(proto.Event{Type: "error", Msg: err.Error()})
-		return nil, "", false
+		return nil, "", 0, false
 	}
 	if !streamUntilReady(s, send) {
-		return nil, "", false
+		return nil, "", 0, false
 	}
 	if !req.NoSync {
+		t := time.Now()
 		s.Barrier(barrierTimeout)
+		barrierMS = time.Since(t).Milliseconds()
 	}
 	if rel, rerr := filepath.Rel(s.root, req.Root); rerr == nil && rel != "." {
 		subPrefix = filepath.ToSlash(rel) + "/"
 	}
-	return s, subPrefix, true
+	return s, subPrefix, barrierMS, true
 }
 
 // handleSymbol serves def (find definitions by name), refs (candidate
 // references by name) and symbols (all definitions in one file).
 func (sv *Server) handleSymbol(req proto.Request, send func(proto.Event) error) {
 	start := time.Now()
-	s, subPrefix, ok := sv.prologue(req, send)
+	s, subPrefix, barrierMS, ok := sv.prologue(req, send)
 	if !ok {
 		return
 	}
@@ -308,13 +329,13 @@ func (sv *Server) handleSymbol(req proto.Request, send func(proto.Event) error) 
 					return
 				}
 				if req.Limit > 0 && emit >= req.Limit {
-					_ = send(proto.Event{Type: "done", Matches: emit, DurMS: time.Since(start).Milliseconds(), Truncated: true})
+					_ = send(proto.Event{Type: "done", Matches: emit, DurMS: time.Since(start).Milliseconds(), BarrierMS: barrierMS, Truncated: true})
 					return
 				}
 			}
 		}
 	}
-	_ = send(proto.Event{Type: "done", Matches: emit, DurMS: time.Since(start).Milliseconds()})
+	_ = send(proto.Event{Type: "done", Matches: emit, DurMS: time.Since(start).Milliseconds(), BarrierMS: barrierMS})
 }
 
 func sortDefHits(hits []index.DefHit) {

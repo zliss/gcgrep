@@ -1,8 +1,9 @@
-// Package ignore implements a pragmatic subset of gitignore matching:
-// root .gitignore only, supporting *, ?, **, anchored (leading /) and
-// directory-only (trailing /) patterns. Negation (!) lines are skipped —
-// a file kept by negation is merely not indexed, never wrongly indexed.
-// .git is always ignored.
+// Package ignore implements exclusion matching for indexing. By design
+// gcgrep indexes EVERYTHING under a root except .git: hidden ignore
+// semantics cost users trust ("why is my file not found?"), so exclusions
+// are explicit only — a .gcgrepignore file at the root, written by the
+// user, with gitignore-style syntax: *, ?, **, anchored (leading /) and
+// directory-only (trailing /) patterns. Negation (!) lines are skipped.
 package ignore
 
 import (
@@ -23,11 +24,14 @@ type Matcher struct {
 	rules []rule
 }
 
-// Load reads root/.gitignore; a missing file yields a matcher with only
-// the built-in .git rule.
+// ControlFile is the per-root exclusion file users may create.
+const ControlFile = ".gcgrepignore"
+
+// Load reads root/.gcgrepignore; a missing file yields a matcher with
+// only the built-in .git rule (i.e. index everything).
 func Load(root string) *Matcher {
 	m := &Matcher{}
-	f, err := os.Open(filepath.Join(root, ".gitignore"))
+	f, err := os.Open(filepath.Join(root, ControlFile))
 	if err != nil {
 		return m
 	}

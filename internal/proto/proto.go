@@ -2,7 +2,7 @@
 // Each request and each response event is one JSON object per line.
 package proto
 
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 type Request struct {
 	Op      string   `json:"op"` // "search" | "status" | "stop"
@@ -15,6 +15,10 @@ type Request struct {
 	Globs   []string `json:"globs,omitempty"`
 	Limit   int      `json:"limit,omitempty"`
 	NoSync  bool     `json:"nosync,omitempty"` // skip the read-after-write barrier
+	// MaxColumns truncates emitted match lines (0 = daemon default 4096,
+	// -1 = unlimited); protects pipes and AI token budgets from minified
+	// single-line JSON/XML.
+	MaxColumns int `json:"maxcols,omitempty"`
 }
 
 // Event.Type values: "progress", "match", "filecount", "done",
@@ -42,6 +46,8 @@ type Event struct {
 	Matches   int   `json:"matches,omitempty"`
 	FileHits  int   `json:"fileHits,omitempty"`
 	DurMS     int64 `json:"durMs,omitempty"`
+	BarrierMS int64 `json:"barrierMs,omitempty"` // read-after-write sync portion
+	SearchMS  int64 `json:"searchMs,omitempty"`  // pure index search portion
 	Truncated bool  `json:"truncated,omitempty"`
 
 	// status
