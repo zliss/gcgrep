@@ -70,4 +70,6 @@ type RootStatus struct {
 	SizeMB        int `json:"sizeMb"`
 	SkippedLarge  int `json:"skippedLarge,omitempty"`  // over GCGREP_MAX_FILESIZE_MB
 	SkippedBudget int `json:"skippedBudget,omitempty"` // over GCGREP_MAX_INDEX_MB
+	SkippedBinary int `json:"skippedBinary,omitempty"` // NUL byte in first 8KB (incl UTF-16)
+	SkippedError  int `json:"skippedError,omitempty"`  // unreadable: permissions etc.
 }

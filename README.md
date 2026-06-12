@@ -109,6 +109,23 @@ gcgrep status | stop | daemon
 Exit codes follow grep: `0` match, `1` no match, `2` error. First search of
 a directory streams indexing progress to stderr.
 
+### What is NOT indexed (complete list)
+
+Every skip is counted and visible in `gcgrep status` — nothing is
+silently unsearchable without a number telling you so:
+
+1. `.git` directories (always).
+2. Rules in a root `.gcgrepignore` (yours).
+3. Symlinks — neither file nor directory links are followed (same as
+   rg's default; prevents loops and double-indexing).
+4. Non-regular files (sockets, fifos, devices).
+5. Files larger than `GCGREP_MAX_FILESIZE_MB` (default 2) → counted.
+6. Files beyond the `GCGREP_MAX_INDEX_MB` budget, if set → counted.
+7. Binary files: NUL byte within the first 8 KB → counted. Note this
+   currently also catches UTF-16 encoded text files (a known gap; rg
+   transcodes them, we do not yet).
+8. Unreadable files/dirs (permissions, vanished mid-read) → counted.
+
 ### Honest limits
 
 - `refs` is **syntax-level**: it cannot distinguish overloads or same-named

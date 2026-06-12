@@ -53,6 +53,8 @@ type RootStore struct {
 	// observability: files not indexed and why (surfaced via status)
 	skippedLarge  atomic.Int64
 	skippedBudget atomic.Int64
+	skippedBinary atomic.Int64
+	skippedError  atomic.Int64 // unreadable (permissions, racing deletes)
 	totalBytes    atomic.Int64
 }
 
@@ -234,6 +236,9 @@ func (s *RootStore) indexFile(rel string) {
 	abs := filepath.Join(s.root, filepath.FromSlash(rel))
 	fi, err := os.Stat(abs)
 	if err != nil || !fi.Mode().IsRegular() {
+		if err != nil && !os.IsNotExist(err) {
+			s.skippedError.Add(1)
+		}
 		s.removeTracked(rel)
 		return
 	}
@@ -251,10 +256,14 @@ func (s *RootStore) indexFile(rel string) {
 	}
 	content, err := os.ReadFile(abs)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			s.skippedError.Add(1)
+		}
 		s.removeTracked(rel)
 		return
 	}
 	if isBinary(content) {
+		s.skippedBinary.Add(1)
 		s.removeTracked(rel)
 		return
 	}

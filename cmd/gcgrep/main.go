@@ -392,6 +392,12 @@ func cmdSimple(op string) int {
 			if r.SkippedBudget > 0 {
 				extra += fmt.Sprintf("  skipped %d files over GCGREP_MAX_INDEX_MB", r.SkippedBudget)
 			}
+			if r.SkippedBinary > 0 {
+				extra += fmt.Sprintf("  skipped %d binary files", r.SkippedBinary)
+			}
+			if r.SkippedError > 0 {
+				extra += fmt.Sprintf("  skipped %d unreadable files", r.SkippedError)
+			}
 			fmt.Printf("  %s  [%s]  %d files, %dMB%s\n", r.Root, r.State, r.Files, r.SizeMB, extra)
 		}
 		if len(ev.Roots) == 0 {

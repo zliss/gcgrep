@@ -151,6 +151,8 @@ func (sv *Server) handleStatus(send func(proto.Event) error) {
 			SizeMB:        int(s.totalBytes.Load() >> 20),
 			SkippedLarge:  int(s.skippedLarge.Load()),
 			SkippedBudget: int(s.skippedBudget.Load()),
+			SkippedBinary: int(s.skippedBinary.Load()),
+			SkippedError:  int(s.skippedError.Load()),
 		})
 	}
 	sv.mu.Unlock()

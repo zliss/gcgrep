@@ -304,3 +304,18 @@ func TestMaxFileSizeAndBudget(t *testing.T) {
 		t.Errorf("expected partial indexing, got %d files", s2.idx.NumFiles())
 	}
 }
+
+func TestSkipCountersVisible(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "bin.dat"), "x\x00binary")
+	write(t, filepath.Join(root, "utf16.txt"), "\xff\xfeh\x00i\x00") // BOM + NULs
+	write(t, filepath.Join(root, "ok.go"), "plain text\n")
+	s := newStore(t, root)
+	defer s.Close()
+	if got := s.skippedBinary.Load(); got != 2 {
+		t.Errorf("skippedBinary = %d, want 2 (binary + utf16)", got)
+	}
+	if s.idx.NumFiles() != 1 {
+		t.Errorf("NumFiles = %d, want 1", s.idx.NumFiles())
+	}
+}
