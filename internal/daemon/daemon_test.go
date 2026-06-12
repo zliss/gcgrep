@@ -5,9 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/zliss/gcgrep/internal/conf"
 	"github.com/zliss/gcgrep/internal/index"
 	"github.com/zliss/gcgrep/internal/symbol"
 )
@@ -29,7 +31,7 @@ func write(t *testing.T, path, content string) {
 
 func newStore(t *testing.T, root string) *RootStore {
 	t.Helper()
-	s, err := newRootStore(root, t.TempDir())
+	s, err := newRootStore(root, t.TempDir(), conf.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +110,7 @@ func TestPersistAndReconcile(t *testing.T) {
 	write(t, filepath.Join(root, "gone.go"), "goneNeedle leaves\n")
 	write(t, filepath.Join(root, "edit.go"), "before edit\n")
 
-	s1, err := newRootStore(root, cache)
+	s1, err := newRootStore(root, cache, conf.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +126,7 @@ func TestPersistAndReconcile(t *testing.T) {
 	write(t, filepath.Join(root, "edit.go"), "after editNeedle\n")
 	write(t, filepath.Join(root, "new.go"), "brand newNeedle\n")
 
-	s2, err := newRootStore(root, cache)
+	s2, err := newRootStore(root, cache, conf.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,5 +263,44 @@ func caller() { s := &UserService{}; _ = s.GetUser(1) }
 	s.Barrier(waitTimeout)
 	if d := s.idx.Defs("ExtraService", false, nil); len(d) != 1 {
 		t.Fatalf("python def not live-indexed: %+v", d)
+	}
+}
+
+func TestMaxFileSizeAndBudget(t *testing.T) {
+	root := t.TempDir()
+	big := strings.Repeat("x", 3<<20)
+	write(t, filepath.Join(root, "big.txt"), big+" bigNeedle\n")
+	write(t, filepath.Join(root, "ok.txt"), "small okNeedle\n")
+	s := newStore(t, root)
+	defer s.Close()
+	if len(hits(s, "bigNeedle")) != 0 {
+		t.Error("over-limit file indexed")
+	}
+	if s.skippedLarge.Load() != 1 {
+		t.Errorf("skippedLarge = %d, want 1", s.skippedLarge.Load())
+	}
+	if len(hits(s, "okNeedle")) != 1 {
+		t.Error("normal file missing")
+	}
+
+	// per-root byte budget
+	root2 := t.TempDir()
+	half := strings.Repeat("y", 600<<10)
+	for i := 0; i < 4; i++ {
+		write(t, filepath.Join(root2, fmt.Sprintf("f%d.txt", i)), half)
+	}
+	cfg := conf.Default()
+	cfg.MaxIndexMB = 1
+	s2, err := newRootStore(root2, t.TempDir(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	s2.WaitReady()
+	if s2.skippedBudget.Load() == 0 {
+		t.Error("budget not enforced")
+	}
+	if s2.idx.NumFiles() == 0 || s2.idx.NumFiles() == 4 {
+		t.Errorf("expected partial indexing, got %d files", s2.idx.NumFiles())
 	}
 }

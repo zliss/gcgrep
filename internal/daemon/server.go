@@ -18,20 +18,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zliss/gcgrep/internal/conf"
 	"github.com/zliss/gcgrep/internal/index"
 	"github.com/zliss/gcgrep/internal/proto"
 	"github.com/zliss/gcgrep/internal/symbol"
 )
 
-const (
-	progressInterval = 300 * time.Millisecond
-	barrierTimeout   = 2 * time.Second
-	// defaultMaxColumns bounds match-line output; minified one-line JSON
-	// files otherwise emit multi-KB lines per match
-	defaultMaxColumns = 4096
-)
-
 type Server struct {
+	cfg      conf.Config
 	mu       sync.Mutex
 	stores   map[string]*RootStore
 	cacheDir string
@@ -40,8 +34,9 @@ type Server struct {
 	stopOnce sync.Once
 }
 
-func NewServer(cacheDir string) *Server {
+func NewServer(cacheDir string, cfg conf.Config) *Server {
 	return &Server{
+		cfg:      cfg,
 		stores:   make(map[string]*RootStore),
 		cacheDir: cacheDir,
 		quit:     make(chan struct{}),
@@ -104,7 +99,7 @@ func (sv *Server) store(path string) (*RootStore, error) {
 			return s, nil
 		}
 	}
-	s, err := newRootStore(path, sv.cacheDir)
+	s, err := newRootStore(path, sv.cacheDir, sv.cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +146,12 @@ func (sv *Server) handleStatus(send func(proto.Event) error) {
 	sv.mu.Lock()
 	ev := proto.Event{Type: "status", PID: os.Getpid()}
 	for root, s := range sv.stores {
-		ev.Roots = append(ev.Roots, proto.RootStatus{Root: root, State: s.State(), Files: s.idx.NumFiles()})
+		ev.Roots = append(ev.Roots, proto.RootStatus{
+			Root: root, State: s.State(), Files: s.idx.NumFiles(),
+			SizeMB:        int(s.totalBytes.Load() >> 20),
+			SkippedLarge:  int(s.skippedLarge.Load()),
+			SkippedBudget: int(s.skippedBudget.Load()),
+		})
 	}
 	sv.mu.Unlock()
 	sort.Slice(ev.Roots, func(i, j int) bool { return ev.Roots[i].Root < ev.Roots[j].Root })
@@ -174,7 +174,7 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 	maxCols := req.MaxColumns
 	switch {
 	case maxCols == 0:
-		maxCols = defaultMaxColumns
+		maxCols = sv.cfg.MaxColumns // 0 = unlimited, matching grep/rg
 	case maxCols < 0:
 		maxCols = 0 // explicit unlimited
 	}
@@ -238,7 +238,11 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 			return a.Line < b.Line
 		})
 		for _, m := range res.Matches {
-			if send(proto.Event{Type: "match", File: strip(m.Path), Line: m.Line, Text: m.Text}) != nil {
+			ev := proto.Event{Type: "match", File: strip(m.Path), Line: m.Line, Text: m.Text}
+			if m.Text == "" && m.LineLen > 0 {
+				ev.Col, ev.LineLen = m.Col, m.LineLen
+			}
+			if send(ev) != nil {
 				return
 			}
 		}
@@ -267,7 +271,7 @@ func (sv *Server) prologue(req proto.Request, send func(proto.Event) error) (s *
 	}
 	if !req.NoSync {
 		t := time.Now()
-		s.Barrier(barrierTimeout)
+		s.Barrier(sv.cfg.BarrierTimeout)
 		barrierMS = time.Since(t).Milliseconds()
 	}
 	if rel, rerr := filepath.Rel(s.root, req.Root); rerr == nil && rel != "." {
@@ -354,7 +358,7 @@ func streamUntilReady(s *RootStore, send func(proto.Event) error) bool {
 	if s.State() == StateReady {
 		return true
 	}
-	tick := time.NewTicker(progressInterval)
+	tick := time.NewTicker(progressIntervalOf(s))
 	defer tick.Stop()
 	for {
 		select {
@@ -369,6 +373,13 @@ func streamUntilReady(s *RootStore, send func(proto.Event) error) bool {
 			}
 		}
 	}
+}
+
+func progressIntervalOf(s *RootStore) time.Duration {
+	if s.cfg.ProgressInterval > 0 {
+		return s.cfg.ProgressInterval
+	}
+	return 300 * time.Millisecond
 }
 
 func compilePattern(req proto.Request) (*regexp.Regexp, error) {
@@ -419,7 +430,11 @@ func Run(l net.Listener, cacheDir, logPath string) error {
 		}
 	}
 	log.Printf("gcgrep daemon %s starting, pid=%d", proto.Version, os.Getpid())
-	sv := NewServer(cacheDir)
+	cfg := conf.Load()
+	if ov := conf.Overrides(); len(ov) > 0 {
+		log.Printf("config overrides: %v", ov)
+	}
+	sv := NewServer(cacheDir, cfg)
 	// persist indexes on SIGTERM/SIGINT (service managers, pkill)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

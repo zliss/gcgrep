@@ -15,8 +15,6 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-const debounce = 200 * time.Millisecond
-
 // CookiePrefix marks barrier cookie files (see RootStore.Barrier): their
 // events bypass debouncing and are never indexed.
 const CookiePrefix = ".gcgrep-cookie-"
@@ -36,31 +34,33 @@ type flushReq struct {
 }
 
 type Watcher struct {
-	fw      *fsnotify.Watcher
-	root    string
-	ignore  func(rel string, isDir bool) bool
-	out     chan Batch
-	done    chan struct{}
-	cookies chan string
-	flushCh chan flushReq
+	fw       *fsnotify.Watcher
+	root     string
+	ignore   func(rel string, isDir bool) bool
+	debounce time.Duration
+	out      chan Batch
+	done     chan struct{}
+	cookies  chan string
+	flushCh  chan flushReq
 }
 
 // New starts watching root recursively. ignore filters directories from
 // registration (rel is slash-separated, relative to root). Batches are
 // delivered on C(); the channel closes on Close.
-func New(root string, ignore func(rel string, isDir bool) bool) (*Watcher, error) {
+func New(root string, ignore func(rel string, isDir bool) bool, debounce time.Duration) (*Watcher, error) {
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 	w := &Watcher{
-		fw:      fw,
-		root:    root,
-		ignore:  ignore,
-		out:     make(chan Batch, 16),
-		done:    make(chan struct{}),
-		cookies: make(chan string, 16),
-		flushCh: make(chan flushReq),
+		fw:       fw,
+		root:     root,
+		ignore:   ignore,
+		debounce: debounce,
+		out:      make(chan Batch, 16),
+		done:     make(chan struct{}),
+		cookies:  make(chan string, 16),
+		flushCh:  make(chan flushReq),
 	}
 	if err := w.addRecursive(root); err != nil {
 		fw.Close()
@@ -136,7 +136,7 @@ func (w *Watcher) loop() {
 	var fire <-chan time.Time
 	reset := func() {
 		if timer == nil {
-			timer = time.NewTimer(debounce)
+			timer = time.NewTimer(w.debounce)
 			fire = timer.C
 			return
 		}
@@ -146,7 +146,7 @@ func (w *Watcher) loop() {
 			default:
 			}
 		}
-		timer.Reset(debounce)
+		timer.Reset(w.debounce)
 	}
 	for {
 		select {

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.0 (2026-06-12)
+
+- All hardcoded tunables are now GCGREP_* environment variables:
+  max file size, per-root index byte budget (new), barrier timeout,
+  watcher debounce, save delay, worker count, default limit/max-columns,
+  client timeouts. Daemon logs effective overrides.
+- `--max-columns` default changed to UNLIMITED (grep/rg parity). When
+  set, long lines transfer as location-only events and the client
+  renders a window centered on the hit from disk.
+- `gcgrep status` now reports indexed size and counts of files skipped
+  for size/budget reasons (previously silent).
+
+
 ## v0.3.0 (2026-06-12)
 
 - BREAKING: `.gitignore` is no longer honored. gcgrep indexes everything

@@ -2,7 +2,7 @@
 // Each request and each response event is one JSON object per line.
 package proto
 
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 type Request struct {
 	Op      string   `json:"op"` // "search" | "status" | "stop"
@@ -31,11 +31,15 @@ type Event struct {
 	Total   int    `json:"total,omitempty"`
 	Stage   string `json:"stage,omitempty"` // "indexing" | "reconciling"
 
-	// match / filecount
-	File  string `json:"file,omitempty"`
-	Line  int    `json:"line,omitempty"`
-	Text  string `json:"text,omitempty"`
-	Count int    `json:"count,omitempty"`
+	// match / filecount. For lines longer than max-columns the daemon
+	// omits Text and sends Col (match offset in line) + LineLen instead;
+	// the client re-reads the file to render a window around the hit.
+	File    string `json:"file,omitempty"`
+	Line    int    `json:"line,omitempty"`
+	Text    string `json:"text,omitempty"`
+	Count   int    `json:"count,omitempty"`
+	Col     int    `json:"col,omitempty"`
+	LineLen int    `json:"lineLen,omitempty"`
 
 	// symbol matches (def / refs / symbols)
 	Name      string `json:"name,omitempty"`
@@ -62,4 +66,8 @@ type RootStatus struct {
 	Root  string `json:"root"`
 	State string `json:"state"` // "indexing" | "reconciling" | "ready"
 	Files int    `json:"files"`
+	// observability: what was NOT indexed and why
+	SizeMB        int `json:"sizeMb"`
+	SkippedLarge  int `json:"skippedLarge,omitempty"`  // over GCGREP_MAX_FILESIZE_MB
+	SkippedBudget int `json:"skippedBudget,omitempty"` // over GCGREP_MAX_INDEX_MB
 }

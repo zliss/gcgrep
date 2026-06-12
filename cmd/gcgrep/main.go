@@ -17,15 +17,41 @@ import (
 	"strings"
 	"time"
 
+	"bytes"
+
+	"github.com/zliss/gcgrep/internal/conf"
 	"github.com/zliss/gcgrep/internal/daemon"
+	"github.com/zliss/gcgrep/internal/index"
 	"github.com/zliss/gcgrep/internal/ipc"
 	"github.com/zliss/gcgrep/internal/proto"
 )
 
-const (
-	dialTimeout  = 500 * time.Millisecond
-	spawnTimeout = 5 * time.Second
-)
+var cfg = conf.Load()
+
+// lineReader lazily reads files to render long-line matches the daemon
+// sent as location-only. Caches the most recent file: matches arrive
+// sorted by path, so consecutive hits in one file cost a single read.
+type lineReader struct {
+	path  string
+	lines [][]byte
+}
+
+func (lr *lineReader) render(absPath string, line, col, lineLen, maxCols int) string {
+	if lr.path != absPath {
+		content, err := os.ReadFile(absPath)
+		if err != nil {
+			return fmt.Sprintf("[line unavailable: %s, %d bytes]", err, lineLen)
+		}
+		lr.path = absPath
+		lr.lines = bytes.Split(content, []byte("\n"))
+	}
+	if line < 1 || line > len(lr.lines) || len(lr.lines[line-1]) != lineLen {
+		// file changed between daemon answer and our read: do not show
+		// content that may no longer correspond to the reported line
+		return fmt.Sprintf("[line changed on disk, %d bytes at match time]", lineLen)
+	}
+	return index.TruncateWindow(lr.lines[line-1], col, maxCols)
+}
 
 func main() {
 	os.Exit(run())
@@ -80,8 +106,14 @@ Options:
   --limit N     stop after N matching lines (default 2000, 0 = no limit)
   --no-sync     skip the read-after-write barrier (faster, may miss writes
                 made in the last fraction of a second)
-  --max-columns N  truncate match lines to N bytes around the hit
-                (default 4096; -1 = unlimited)
+  --max-columns N  cap displayed match lines to a window of N bytes
+                around the hit (default unlimited, like grep/rg; long
+                lines transfer as location-only and render from disk)
+
+Tunables via env (daemon logs effective overrides): GCGREP_MAX_FILESIZE_MB
+(default 2), GCGREP_MAX_INDEX_MB (0=unlimited), GCGREP_BARRIER_TIMEOUT_MS,
+GCGREP_DEBOUNCE_MS, GCGREP_SAVE_DELAY_MS, GCGREP_WORKERS, GCGREP_LIMIT,
+GCGREP_MAX_COLUMNS, GCGREP_SPAWN_TIMEOUT_MS, GCGREP_DIAL_TIMEOUT_MS.
 
 First search of a directory builds the index (progress on stderr); later
 searches and file changes are served from the live index.
@@ -128,7 +160,7 @@ func parseArgs(args []string) (cliOpts, error) {
 	fs.BoolVar(&o.req.Count, "c", false, "")
 	fs.Var(&globs, "g", "")
 	fs.BoolVar(&o.jsonOut, "json", false, "")
-	fs.IntVar(&o.req.Limit, "limit", 2000, "")
+	fs.IntVar(&o.req.Limit, "limit", cfg.Limit, "")
 	fs.BoolVar(&o.req.NoSync, "no-sync", false, "")
 	fs.IntVar(&o.req.MaxColumns, "max-columns", 0, "")
 	if err := fs.Parse(args); err != nil {
@@ -245,6 +277,11 @@ func streamSearch(conn net.Conn, o cliOpts) int {
 	dec := json.NewDecoder(bufio.NewReader(conn))
 	matched := false
 	progressShown := false
+	var lr lineReader
+	displayCols := o.req.MaxColumns
+	if displayCols == 0 {
+		displayCols = cfg.MaxColumns // 0 = unlimited, like grep/rg
+	}
 	// prefix printed before each file path, mirroring the PATH argument
 	prefix := ""
 	if o.pathArg != "." {
@@ -276,6 +313,10 @@ func streamSearch(conn net.Conn, o cliOpts) int {
 			progressShown = true
 		case "match":
 			clearProgress(&progressShown)
+			if ev.Text == "" && ev.LineLen > 0 {
+				// long line: daemon sent location only; render from disk
+				ev.Text = lr.render(filepath.Join(o.req.Root, filepath.FromSlash(ev.File)), ev.Line, ev.Col, ev.LineLen, displayCols)
+			}
 			if ev.Kind != "" {
 				qual := ev.Kind
 				if ev.Container != "" {
@@ -321,7 +362,7 @@ func clearProgress(shown *bool) {
 }
 
 func cmdSimple(op string) int {
-	conn, err := ipc.Dial(dialTimeout)
+	conn, err := ipc.Dial(cfg.DialTimeout)
 	if err != nil {
 		if op == "stop" {
 			fmt.Println("gcgrep: daemon not running")
@@ -344,7 +385,14 @@ func cmdSimple(op string) int {
 	case "status":
 		fmt.Printf("daemon running, pid %d\n", ev.PID)
 		for _, r := range ev.Roots {
-			fmt.Printf("  %s  [%s]  %d files\n", r.Root, r.State, r.Files)
+			extra := ""
+			if r.SkippedLarge > 0 {
+				extra += fmt.Sprintf("  skipped %d files > GCGREP_MAX_FILESIZE_MB", r.SkippedLarge)
+			}
+			if r.SkippedBudget > 0 {
+				extra += fmt.Sprintf("  skipped %d files over GCGREP_MAX_INDEX_MB", r.SkippedBudget)
+			}
+			fmt.Printf("  %s  [%s]  %d files, %dMB%s\n", r.Root, r.State, r.Files, r.SizeMB, extra)
 		}
 		if len(ev.Roots) == 0 {
 			fmt.Println("  (no roots indexed yet)")
@@ -361,7 +409,7 @@ func cmdSimple(op string) int {
 // connectOrSpawn dials the daemon, starting it on demand. Concurrent
 // spawns are harmless: the loser fails to bind and exits.
 func connectOrSpawn() (net.Conn, error) {
-	if conn, err := ipc.Dial(dialTimeout); err == nil {
+	if conn, err := ipc.Dial(cfg.DialTimeout); err == nil {
 		return conn, nil
 	}
 	exe, err := os.Executable()
@@ -371,12 +419,12 @@ func connectOrSpawn() (net.Conn, error) {
 	if err := spawnDaemon(exe); err != nil {
 		return nil, fmt.Errorf("starting daemon: %w", err)
 	}
-	deadline := time.Now().Add(spawnTimeout)
+	deadline := time.Now().Add(cfg.SpawnTimeout)
 	for time.Now().Before(deadline) {
-		if conn, derr := ipc.Dial(dialTimeout); derr == nil {
+		if conn, derr := ipc.Dial(cfg.DialTimeout); derr == nil {
 			return conn, nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return nil, fmt.Errorf("daemon did not come up within %s (see daemon.log in cache dir)", spawnTimeout)
+	return nil, fmt.Errorf("daemon did not come up within %s (see daemon.log in cache dir)", cfg.SpawnTimeout)
 }

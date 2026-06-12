@@ -180,14 +180,16 @@ func TestMaxColumnsTruncation(t *testing.T) {
 	if len(res.Matches) != 1 {
 		t.Fatalf("match lost: %+v", res.Matches)
 	}
-	text := res.Matches[0].Text
-	if len(text) > 210 {
-		t.Fatalf("not truncated: len=%d", len(text))
+	m := res.Matches[0]
+	if m.Text != "" || m.Col != 3000 || m.LineLen != len(long) {
+		t.Fatalf("long line should be location-only: %+v", m)
 	}
-	if !strings.Contains(text, "NEEDLE") {
-		t.Fatalf("hit not visible in truncated window: %q", text)
+	// the client-side window renderer keeps the hit visible
+	win := TruncateWindow([]byte(long), m.Col, 200)
+	if len(win) > 220 || !strings.Contains(win, "NEEDLE") {
+		t.Fatalf("window wrong: len=%d", len(win))
 	}
-	// unlimited keeps the full line
+	// unlimited keeps the full line inline
 	res = ix.Search(regexp.MustCompile("NEEDLE"), SearchOpts{Literal: "needle"})
 	if len(res.Matches[0].Text) != len(long) {
 		t.Fatal("untruncated line modified")

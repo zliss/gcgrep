@@ -11,12 +11,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/zliss/gcgrep/internal/conf"
 	"github.com/zliss/gcgrep/internal/ignore"
 	"github.com/zliss/gcgrep/internal/index"
 	"github.com/zliss/gcgrep/internal/symbol"
@@ -27,8 +27,6 @@ const (
 	StateIndexing    = "indexing"
 	StateReconciling = "reconciling"
 	StateReady       = "ready"
-
-	saveDelay = 30 * time.Second
 )
 
 // RootStore owns the index, watcher and persistence for one indexed root.
@@ -50,14 +48,21 @@ type RootStore struct {
 
 	barrierMu sync.Mutex
 	cookieSeq atomic.Int64
+
+	cfg conf.Config
+	// observability: files not indexed and why (surfaced via status)
+	skippedLarge  atomic.Int64
+	skippedBudget atomic.Int64
+	totalBytes    atomic.Int64
 }
 
 // newRootStore loads any persisted index, starts the watcher BEFORE the
 // reconcile/scan pass (so changes during the pass are not lost), then
 // builds or reconciles in the background.
-func newRootStore(root, cacheDir string) (*RootStore, error) {
+func newRootStore(root, cacheDir string, cfg conf.Config) (*RootStore, error) {
 	s := &RootStore{
 		root:     root,
+		cfg:      cfg,
 		ign:      ignore.Load(root),
 		cacheDir: cacheDir,
 		ready:    make(chan struct{}),
@@ -72,7 +77,7 @@ func newRootStore(root, cacheDir string) (*RootStore, error) {
 		s.state.Store(StateReconciling)
 	}
 
-	w, err := watch.New(root, s.ign.Ignored)
+	w, err := watch.New(root, s.ign.Ignored, cfg.Debounce)
 	if err != nil {
 		return nil, fmt.Errorf("watch %s: %w", root, err)
 	}
@@ -178,7 +183,7 @@ func (s *RootStore) fullScan() {
 func (s *RootStore) indexParallel(rels []string) {
 	jobs := make(chan string)
 	var wg sync.WaitGroup
-	for i := 0; i < runtime.NumCPU(); i++ {
+	for i := 0; i < s.cfg.Workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -228,20 +233,45 @@ func (s *RootStore) reconcile() {
 func (s *RootStore) indexFile(rel string) {
 	abs := filepath.Join(s.root, filepath.FromSlash(rel))
 	fi, err := os.Stat(abs)
-	if err != nil || !fi.Mode().IsRegular() || fi.Size() > index.MaxFileSize {
-		s.idx.Remove(rel)
+	if err != nil || !fi.Mode().IsRegular() {
+		s.removeTracked(rel)
+		return
+	}
+	if fi.Size() > s.cfg.MaxFileSize() {
+		s.skippedLarge.Add(1)
+		s.removeTracked(rel)
+		return
+	}
+	if s.cfg.MaxIndexMB > 0 && s.totalBytes.Load()+fi.Size() > int64(s.cfg.MaxIndexMB)<<20 {
+		if s.skippedBudget.Add(1) == 1 {
+			log.Printf("index budget GCGREP_MAX_INDEX_MB=%d reached on %s: further files skipped", s.cfg.MaxIndexMB, s.root)
+		}
+		s.removeTracked(rel)
 		return
 	}
 	content, err := os.ReadFile(abs)
 	if err != nil {
-		s.idx.Remove(rel)
+		s.removeTracked(rel)
 		return
 	}
 	if isBinary(content) {
-		s.idx.Remove(rel)
+		s.removeTracked(rel)
 		return
 	}
+	if old, ok := s.idx.Meta(rel); ok {
+		s.totalBytes.Add(-old.Size)
+	}
+	s.totalBytes.Add(fi.Size())
 	s.idx.Add(index.FileMeta{Path: rel, Size: fi.Size(), MtimeNS: fi.ModTime().UnixNano()}, content)
+}
+
+// removeTracked removes a file from the index keeping the byte budget
+// accounting consistent.
+func (s *RootStore) removeTracked(rel string) {
+	if old, ok := s.idx.Meta(rel); ok {
+		s.totalBytes.Add(-old.Size)
+	}
+	s.idx.Remove(rel)
 }
 
 func isCookie(rel string) bool {
@@ -432,7 +462,7 @@ func (s *RootStore) loadPersisted() *index.Index {
 	idx := index.New(s.root)
 	jobs := make(chan int)
 	var wg sync.WaitGroup
-	for w := 0; w < runtime.NumCPU(); w++ {
+	for w := 0; w < s.cfg.Workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -446,6 +476,11 @@ func (s *RootStore) loadPersisted() *index.Index {
 	}
 	close(jobs)
 	wg.Wait()
+	var total int64
+	for _, m := range p.Metas {
+		total += m.Size
+	}
+	s.totalBytes.Store(total)
 	return idx
 }
 
@@ -456,7 +491,7 @@ func (s *RootStore) scheduleSave() {
 	if s.saveTimer != nil {
 		s.saveTimer.Stop()
 	}
-	s.saveTimer = time.AfterFunc(saveDelay, s.save)
+	s.saveTimer = time.AfterFunc(s.cfg.SaveDelay, s.save)
 }
 
 func (s *RootStore) save() {

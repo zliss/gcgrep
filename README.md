@@ -58,9 +58,17 @@ $ gcgrep 'leaderelection' ./kubernetes     # plain grep, but 5ms warm
   sources, build output) are often exactly what you want to search.
   Always skips `.git`, binaries and files > 2 MB; add a `.gcgrepignore`
   at the root (gitignore syntax) for anything else.
-- **Long-line safe**: match lines are truncated to a window around the hit
-  (default 4096 bytes, `--max-columns`), so minified one-line JSON/XML
-  doesn't flood pipes or AI token budgets.
+- **Long-line aware**: full lines by default (grep/rg parity). With
+  `--max-columns N` (or `GCGREP_MAX_COLUMNS`), long lines travel as
+  location-only events and the client renders an N-byte window centered
+  on the hit — recommended for AI agents to protect token budgets.
+- **Tunable**: every former hardcoded limit is a `GCGREP_*` env var —
+  `GCGREP_MAX_FILESIZE_MB` (default 2; larger files are skipped and
+  counted in `gcgrep status`), `GCGREP_MAX_INDEX_MB` (per-root RAM
+  budget), `GCGREP_BARRIER_TIMEOUT_MS`, `GCGREP_DEBOUNCE_MS`,
+  `GCGREP_SAVE_DELAY_MS`, `GCGREP_WORKERS`, `GCGREP_LIMIT`,
+  `GCGREP_MAX_COLUMNS`, `GCGREP_SPAWN_TIMEOUT_MS`, `GCGREP_DIAL_TIMEOUT_MS`.
+  The daemon logs effective overrides at startup.
 
 ## Install
 

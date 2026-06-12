@@ -301,6 +301,11 @@ type Match struct {
 	Path string
 	Line int // 1-based
 	Text string
+	// When the matched line exceeds SearchOpts.MaxColumns, Text is left
+	// empty and the client re-reads the file to render: Col is the match
+	// byte offset within the line, LineLen the full line length.
+	Col     int
+	LineLen int
 }
 
 type SearchOpts struct {
@@ -393,18 +398,21 @@ func appendLineMatches(res *SearchResult, f *fileEntry, locs [][]int, limit, max
 		} else {
 			end = len(content)
 		}
-		text := truncateLine(content[start:end], loc[0]-start, maxCols)
-		res.Matches = append(res.Matches, Match{Path: f.meta.Path, Line: lineNo, Text: text})
+		m := Match{Path: f.meta.Path, Line: lineNo, Col: loc[0] - start, LineLen: end - start}
+		if maxCols <= 0 || end-start <= maxCols {
+			m.Text = string(content[start:end])
+		}
+		res.Matches = append(res.Matches, m)
 		if limit > 0 && len(res.Matches) >= limit {
 			return
 		}
 	}
 }
 
-// truncateLine caps a match line at maxCols bytes, keeping a window
-// around the match start so the hit itself stays visible even when it
-// sits deep inside a minified single-line file.
-func truncateLine(line []byte, matchOff, maxCols int) string {
+// TruncateWindow caps a line at maxCols bytes, keeping a window around
+// the match offset so the hit stays visible even deep inside a minified
+// single-line file. Used by the client when rendering long-line matches.
+func TruncateWindow(line []byte, matchOff, maxCols int) string {
 	if maxCols <= 0 || len(line) <= maxCols {
 		return string(line)
 	}
