@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -24,10 +23,17 @@ import (
 	"github.com/zliss/gcgrep/internal/symbol"
 )
 
+// storeKey identifies a store: the same root with and without -L
+// (follow symlinks) indexes different file sets.
+type storeKey struct {
+	root   string
+	follow bool
+}
+
 type Server struct {
 	cfg      conf.Config
 	mu       sync.Mutex
-	stores   map[string]*RootStore
+	stores   map[storeKey]*RootStore
 	cacheDir string
 	quit     chan struct{} // closed when shutdown begins (stop accepting)
 	stopped  chan struct{} // closed when all stores are saved
@@ -37,7 +43,7 @@ type Server struct {
 func NewServer(cacheDir string, cfg conf.Config) *Server {
 	return &Server{
 		cfg:      cfg,
-		stores:   make(map[string]*RootStore),
+		stores:   make(map[storeKey]*RootStore),
 		cacheDir: cacheDir,
 		quit:     make(chan struct{}),
 		stopped:  make(chan struct{}),
@@ -91,19 +97,19 @@ func (sv *Server) doStop() {
 
 // store returns the RootStore covering path: an existing root that equals
 // or contains path is reused; otherwise a new store is created for path.
-func (sv *Server) store(path string) (*RootStore, error) {
+func (sv *Server) store(path string, follow bool) (*RootStore, error) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
-	for root, s := range sv.stores {
-		if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+	for key, s := range sv.stores {
+		if key.follow == follow && (path == key.root || strings.HasPrefix(path, key.root+string(filepath.Separator))) {
 			return s, nil
 		}
 	}
-	s, err := newRootStore(path, sv.cacheDir, sv.cfg)
+	s, err := newRootStore(path, sv.cacheDir, sv.cfg, follow)
 	if err != nil {
 		return nil, err
 	}
-	sv.stores[path] = s
+	sv.stores[storeKey{root: path, follow: follow}] = s
 	return s, nil
 }
 
@@ -113,6 +119,9 @@ func (sv *Server) handle(conn net.Conn) {
 	w := bufio.NewWriter(conn)
 	enc := json.NewEncoder(w)
 	send := func(ev proto.Event) error {
+		if ev.Type == "done" || ev.Type == "status" {
+			ev.V = proto.Version // lets a mismatched client warn
+		}
 		if err := enc.Encode(ev); err != nil {
 			return err
 		}
@@ -145,14 +154,16 @@ func (sv *Server) handle(conn net.Conn) {
 func (sv *Server) handleStatus(send func(proto.Event) error) {
 	sv.mu.Lock()
 	ev := proto.Event{Type: "status", PID: os.Getpid()}
-	for root, s := range sv.stores {
+	for key, s := range sv.stores {
 		ev.Roots = append(ev.Roots, proto.RootStatus{
-			Root: root, State: s.State(), Files: s.idx.NumFiles(),
+			Root: key.root, State: s.State(), Files: s.idx.NumFiles(),
 			SizeMB:        int(s.totalBytes.Load() >> 20),
 			SkippedLarge:  int(s.skippedLarge.Load()),
 			SkippedBudget: int(s.skippedBudget.Load()),
 			SkippedBinary: int(s.skippedBinary.Load()),
 			SkippedError:  int(s.skippedError.Load()),
+			StreamFiles:   s.streamCount(),
+			Follow:        key.follow,
 		})
 	}
 	sv.mu.Unlock()
@@ -162,11 +173,12 @@ func (sv *Server) handleStatus(send func(proto.Event) error) {
 
 func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) {
 	start := time.Now()
-	re, err := compilePattern(req)
+	m, err := index.MatcherFor(req.Pattern, req.Fixed, req.NoCase)
 	if err != nil {
 		_ = send(proto.Event{Type: "error", Msg: "bad pattern: " + err.Error()})
 		return
 	}
+	re := m.Re
 	s, subPrefix, barrierMS, ok := sv.prologue(req, send)
 	if !ok {
 		return
@@ -181,34 +193,33 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 		maxCols = 0 // explicit unlimited
 	}
 	opts := index.SearchOpts{
-		MaxColumns: maxCols,
-		Literal:    index.ExtractLiteral(req.Pattern, req.Fixed),
-		FilesOnly:  req.Files || req.Count,
-		Limit:      req.Limit,
+		MaxColumns:   maxCols,
+		Literal:      index.ExtractLiteral(req.Pattern, req.Fixed),
+		FilesOnly:    req.Files || req.Count,
+		Limit:        req.Limit,
+		PlainLiteral: m.PlainLit,
+		FoldCase:     m.Fold,
+		MaxFileSize:  req.MaxFilesize,
 	}
-	// pure literals skip the regex engine; the ASCII fold fast path is
-	// only safe when the needle itself is ASCII
-	if lit, ok := index.PlainLiteral(req.Pattern, req.Fixed); ok {
-		if !req.NoCase {
-			opts.PlainLiteral = lit
-		} else if !index.HasNonASCII(lit) {
-			opts.PlainLiteral = lit
-			opts.FoldCase = true
-		}
-	}
-	if pm, perr := globMatcher(req.Globs); perr != nil {
+	pm, perr := globMatcher(req.Globs)
+	if perr != nil {
 		_ = send(proto.Event{Type: "error", Msg: "bad glob: " + perr.Error()})
 		return
-	} else {
-		opts.PathMatch = pm
 	}
+	// path filters compose over the request-relative path: glob, then the
+	// hidden filter (dot segments skipped unless --hidden, rg default)
+	reqOK := pm
+	if !req.Hidden {
+		inner := reqOK
+		reqOK = func(p string) bool { return !hiddenPath(p) && (inner == nil || inner(p)) }
+	}
+	opts.PathMatch = reqOK
 	if subPrefix != "" {
-		inner := opts.PathMatch
 		opts.PathMatch = func(p string) bool {
 			if !strings.HasPrefix(p, subPrefix) {
 				return false
 			}
-			return inner == nil || inner(strip(p))
+			return reqOK == nil || reqOK(strip(p))
 		}
 	}
 	searchStart := time.Now()
@@ -249,6 +260,13 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 			}
 		}
 	}
+	// stream-set files passing the same filters are announced for the
+	// client to scan from disk (the daemon holds only their manifest)
+	for _, sf := range s.StreamList(req.MaxFilesize, opts.PathMatch) {
+		if send(proto.Event{Type: "streamfile", File: strip(sf.Rel), Size: sf.Size}) != nil {
+			return
+		}
+	}
 	total := 0
 	for _, c := range res.FileCounts {
 		total += c
@@ -263,7 +281,7 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 // and the subtree prefix ("" when req.Root is the store root), or ok=false
 // if an error was already sent / the client left.
 func (sv *Server) prologue(req proto.Request, send func(proto.Event) error) (s *RootStore, subPrefix string, barrierMS int64, ok bool) {
-	s, err := sv.store(req.Root)
+	s, err := sv.store(req.Root, req.Follow)
 	if err != nil {
 		_ = send(proto.Event{Type: "error", Msg: err.Error()})
 		return nil, "", 0, false
@@ -291,7 +309,12 @@ func (sv *Server) handleSymbol(req proto.Request, send func(proto.Event) error) 
 		return
 	}
 	strip := func(p string) string { return strings.TrimPrefix(p, subPrefix) }
-	inSubtree := func(p string) bool { return subPrefix == "" || strings.HasPrefix(p, subPrefix) }
+	inSubtree := func(p string) bool {
+		if subPrefix != "" && !strings.HasPrefix(p, subPrefix) {
+			return false
+		}
+		return req.Hidden || !hiddenPath(strings.TrimPrefix(p, subPrefix))
+	}
 
 	emit := 0
 	send1 := func(ev proto.Event) bool {
@@ -384,15 +407,20 @@ func progressIntervalOf(s *RootStore) time.Duration {
 	return 300 * time.Millisecond
 }
 
-func compilePattern(req proto.Request) (*regexp.Regexp, error) {
-	pat := req.Pattern
-	if req.Fixed {
-		pat = regexp.QuoteMeta(pat)
+// hiddenPath reports whether any segment of the slash-separated relative
+// path starts with a dot (rg's default hidden-file exclusion).
+func hiddenPath(rel string) bool {
+	for len(rel) > 0 {
+		if rel[0] == '.' {
+			return true
+		}
+		i := strings.IndexByte(rel, '/')
+		if i < 0 {
+			return false
+		}
+		rel = rel[i+1:]
 	}
-	if req.NoCase {
-		pat = "(?i)" + pat
-	}
-	return regexp.Compile(pat)
+	return false
 }
 
 // globMatcher matches a relative slashed path if any glob matches either
@@ -433,6 +461,11 @@ func Run(l net.Listener, cacheDir, logPath string) error {
 	}
 	log.Printf("gcgrep daemon %s starting, pid=%d", proto.Version, os.Getpid())
 	cfg := conf.Load()
+	if cfg.Priority != "normal" {
+		if perr := lowerPriority(); perr != nil {
+			log.Printf("lowering process priority: %v", perr)
+		}
+	}
 	if ov := conf.Overrides(); len(ov) > 0 {
 		log.Printf("config overrides: %v", ov)
 	}

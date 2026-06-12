@@ -8,11 +8,14 @@
 package watch
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"github.com/zliss/gcgrep/internal/walkdir"
 )
 
 // CookiePrefix marks barrier cookie files (see RootStore.Barrier): their
@@ -37,6 +40,7 @@ type Watcher struct {
 	fw       *fsnotify.Watcher
 	root     string
 	ignore   func(rel string, isDir bool) bool
+	follow   bool // traverse symlinked directories (rg -L)
 	debounce time.Duration
 	out      chan Batch
 	done     chan struct{}
@@ -47,7 +51,7 @@ type Watcher struct {
 // New starts watching root recursively. ignore filters directories from
 // registration (rel is slash-separated, relative to root). Batches are
 // delivered on C(); the channel closes on Close.
-func New(root string, ignore func(rel string, isDir bool) bool, debounce time.Duration) (*Watcher, error) {
+func New(root string, ignore func(rel string, isDir bool) bool, debounce time.Duration, follow bool) (*Watcher, error) {
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -56,6 +60,7 @@ func New(root string, ignore func(rel string, isDir bool) bool, debounce time.Du
 		fw:       fw,
 		root:     root,
 		ignore:   ignore,
+		follow:   follow,
 		debounce: debounce,
 		out:      make(chan Batch, 16),
 		done:     make(chan struct{}),
@@ -109,21 +114,18 @@ func (w *Watcher) Close() {
 func (w *Watcher) AddRecursive(dir string) error { return w.addRecursive(dir) }
 
 func (w *Watcher) addRecursive(dir string) error {
-	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // racing deletes are normal; the next batch corrects
-		}
-		if !d.IsDir() {
+	// walkdir.Walk never visits its root, so register dir itself first
+	_ = w.fw.Add(dir)
+	return walkdir.Walk(dir, w.follow, func(path string, isDir bool, fi os.FileInfo) error {
+		if !isDir {
 			return nil
 		}
 		rel, rerr := filepath.Rel(w.root, path)
 		if rerr == nil && rel != "." && w.ignore(filepath.ToSlash(rel), true) {
-			return filepath.SkipDir
+			return fs.SkipDir
 		}
-		if aerr := w.fw.Add(path); aerr != nil {
-			// directory may have vanished between walk and Add
-			return nil
-		}
+		// Add failures (racing deletes) are normal; the next batch corrects
+		_ = w.fw.Add(path)
 		return nil
 	})
 }

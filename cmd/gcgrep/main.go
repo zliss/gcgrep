@@ -102,6 +102,10 @@ Options:
   -l            print only names of files with matches
   -c            print match counts per file
   -g GLOB       only search files matching GLOB (repeatable)
+  --hidden      search hidden files and directories (skipped by default)
+  -a, --text    search binary files as if they were text
+  -L, --follow  follow symbolic links (separate index per mode)
+  --max-filesize SIZE  skip files larger than SIZE (K/M/G suffixes)
   --json        output one JSON object per event (machine-readable)
   --limit N     stop after N matching lines (default 2000, 0 = no limit)
   --no-sync     skip the read-after-write barrier (faster, may miss writes
@@ -113,7 +117,12 @@ Options:
 Tunables via env (daemon logs effective overrides): GCGREP_MAX_FILESIZE_MB
 (default 2), GCGREP_MAX_INDEX_MB (0=unlimited), GCGREP_BARRIER_TIMEOUT_MS,
 GCGREP_DEBOUNCE_MS, GCGREP_SAVE_DELAY_MS, GCGREP_WORKERS, GCGREP_LIMIT,
-GCGREP_MAX_COLUMNS, GCGREP_SPAWN_TIMEOUT_MS, GCGREP_DIAL_TIMEOUT_MS.
+GCGREP_MAX_COLUMNS, GCGREP_SPAWN_TIMEOUT_MS, GCGREP_DIAL_TIMEOUT_MS,
+GCGREP_PRIORITY (low|normal, daemon process priority, default low).
+
+Files over GCGREP_MAX_FILESIZE_MB, binary files and files past the index
+budget remain searchable: the daemon tracks them and the client scans
+them from disk at query time (rg-style), so no file silently disappears.
 
 First search of a directory builds the index (progress on stderr); later
 searches and file changes are served from the live index.
@@ -163,8 +172,19 @@ func parseArgs(args []string) (cliOpts, error) {
 	fs.IntVar(&o.req.Limit, "limit", cfg.Limit, "")
 	fs.BoolVar(&o.req.NoSync, "no-sync", false, "")
 	fs.IntVar(&o.req.MaxColumns, "max-columns", 0, "")
+	fs.BoolVar(&o.req.Hidden, "hidden", false, "")
+	fs.BoolVar(&o.req.Text, "a", false, "")
+	fs.BoolVar(&o.req.Text, "text", false, "")
+	fs.BoolVar(&o.req.Follow, "L", false, "")
+	fs.BoolVar(&o.req.Follow, "follow", false, "")
+	var maxFilesize string
+	fs.StringVar(&maxFilesize, "max-filesize", "", "")
 	if err := fs.Parse(args); err != nil {
 		return o, err
+	}
+	var serr error
+	if o.req.MaxFilesize, serr = parseSize(maxFilesize); serr != nil {
+		return o, serr
 	}
 	rest := fs.Args()
 	if len(rest) < 1 || len(rest) > 2 {
@@ -287,13 +307,44 @@ func streamSearch(conn net.Conn, o cliOpts) int {
 	if o.pathArg != "." {
 		prefix = filepath.ToSlash(filepath.Clean(o.pathArg)) + "/"
 	}
+	var streamFiles []string
+	recvMatches := 0
+	// limitLeft computes the match-line budget remaining for stream scans
+	limitLeft := func() int {
+		if o.req.Limit <= 0 {
+			return -1
+		}
+		if left := o.req.Limit - recvMatches; left > 0 {
+			return left
+		}
+		return 0
+	}
 	for {
 		var ev proto.Event
 		if err := dec.Decode(&ev); err != nil {
 			fmt.Fprintln(os.Stderr, "gcgrep: connection lost:", err)
 			return 2
 		}
+		if ev.Type == "streamfile" {
+			// collected silently; scanned client-side when "done" arrives
+			streamFiles = append(streamFiles, ev.File)
+			continue
+		}
+		if ev.Type == "done" {
+			warnVersion(ev.V)
+		}
 		if o.jsonOut {
+			if ev.Type == "match" {
+				recvMatches++
+			}
+			if ev.Type == "done" {
+				// scan stream files BEFORE emitting done so consumers can
+				// keep treating done as the terminal event
+				ss := scanStreams(streamFiles, out, o, prefix, displayCols, limitLeft())
+				ev.Matches += ss.matches
+				ev.FileHits += ss.fileHits
+				ev.Truncated = ev.Truncated || ss.truncated
+			}
 			b, _ := json.Marshal(&ev)
 			fmt.Fprintln(out, string(b))
 			if ev.Type == "done" || ev.Type == "error" {
@@ -328,6 +379,7 @@ func streamSearch(conn net.Conn, o cliOpts) int {
 			} else {
 				fmt.Fprintf(out, "%s%s:%d:%s\n", prefix, ev.File, ev.Line, ev.Text)
 			}
+			recvMatches++
 			matched = true
 		case "filecount":
 			clearProgress(&progressShown)
@@ -339,7 +391,11 @@ func streamSearch(conn net.Conn, o cliOpts) int {
 			matched = true
 		case "done":
 			clearProgress(&progressShown)
-			if ev.Truncated {
+			ss := scanStreams(streamFiles, out, o, prefix, displayCols, limitLeft())
+			if ss.matches > 0 {
+				matched = true
+			}
+			if ev.Truncated || ss.truncated {
 				fmt.Fprintf(os.Stderr, "gcgrep: output truncated at %d lines (use --limit 0 for all)\n", o.req.Limit)
 			}
 			if matched || ev.Matches > 0 {
@@ -351,6 +407,19 @@ func streamSearch(conn net.Conn, o cliOpts) int {
 			fmt.Fprintln(os.Stderr, "gcgrep:", ev.Msg)
 			return 2
 		}
+	}
+}
+
+// warnVersion alerts on daemon/client version skew: an old daemon
+// silently ignores new request fields (hidden/follow/...) and returns
+// misleading results. ev.V is empty from pre-0.5 daemons.
+func warnVersion(v string) {
+	if v != proto.Version {
+		got := v
+		if got == "" {
+			got = "pre-0.5"
+		}
+		fmt.Fprintf(os.Stderr, "gcgrep: daemon is version %s but client is %s; run 'gcgrep stop' to restart it\n", got, proto.Version)
 	}
 }
 
@@ -383,6 +452,7 @@ func cmdSimple(op string) int {
 	}
 	switch ev.Type {
 	case "status":
+		warnVersion(ev.V)
 		fmt.Printf("daemon running, pid %d\n", ev.PID)
 		for _, r := range ev.Roots {
 			extra := ""
@@ -398,7 +468,14 @@ func cmdSimple(op string) int {
 			if r.SkippedError > 0 {
 				extra += fmt.Sprintf("  skipped %d unreadable files", r.SkippedError)
 			}
-			fmt.Printf("  %s  [%s]  %d files, %dMB%s\n", r.Root, r.State, r.Files, r.SizeMB, extra)
+			if r.StreamFiles > 0 {
+				extra += fmt.Sprintf("  %d stream-set files (scanned from disk at query time)", r.StreamFiles)
+			}
+			mode := ""
+			if r.Follow {
+				mode = " (-L)"
+			}
+			fmt.Printf("  %s%s  [%s]  %d files, %dMB%s\n", r.Root, mode, r.State, r.Files, r.SizeMB, extra)
 		}
 		if len(ev.Roots) == 0 {
 			fmt.Println("  (no roots indexed yet)")

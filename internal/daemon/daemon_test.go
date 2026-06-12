@@ -31,7 +31,7 @@ func write(t *testing.T, path, content string) {
 
 func newStore(t *testing.T, root string) *RootStore {
 	t.Helper()
-	s, err := newRootStore(root, t.TempDir(), conf.Default())
+	s, err := newRootStore(root, t.TempDir(), conf.Default(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestPersistAndReconcile(t *testing.T) {
 	write(t, filepath.Join(root, "gone.go"), "goneNeedle leaves\n")
 	write(t, filepath.Join(root, "edit.go"), "before edit\n")
 
-	s1, err := newRootStore(root, cache, conf.Default())
+	s1, err := newRootStore(root, cache, conf.Default(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestPersistAndReconcile(t *testing.T) {
 	write(t, filepath.Join(root, "edit.go"), "after editNeedle\n")
 	write(t, filepath.Join(root, "new.go"), "brand newNeedle\n")
 
-	s2, err := newRootStore(root, cache, conf.Default())
+	s2, err := newRootStore(root, cache, conf.Default(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,6 +266,8 @@ func caller() { s := &UserService{}; _ = s.GetUser(1) }
 	}
 }
 
+// v0.5 semantics: oversized / over-budget / binary files are not lost —
+// they land in the stream manifest, announced to the client for disk scan.
 func TestMaxFileSizeAndBudget(t *testing.T) {
 	root := t.TempDir()
 	big := strings.Repeat("x", 3<<20)
@@ -282,6 +284,14 @@ func TestMaxFileSizeAndBudget(t *testing.T) {
 	if len(hits(s, "okNeedle")) != 1 {
 		t.Error("normal file missing")
 	}
+	sf := s.StreamList(0, nil)
+	if len(sf) != 1 || sf[0].Rel != "big.txt" {
+		t.Errorf("stream manifest = %+v, want [big.txt]", sf)
+	}
+	// --max-filesize filters the manifest
+	if got := s.StreamList(1<<20, nil); len(got) != 0 {
+		t.Errorf("max-filesize filter ignored: %+v", got)
+	}
 
 	// per-root byte budget
 	root2 := t.TempDir()
@@ -291,7 +301,7 @@ func TestMaxFileSizeAndBudget(t *testing.T) {
 	}
 	cfg := conf.Default()
 	cfg.MaxIndexMB = 1
-	s2, err := newRootStore(root2, t.TempDir(), cfg)
+	s2, err := newRootStore(root2, t.TempDir(), cfg, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,19 +313,89 @@ func TestMaxFileSizeAndBudget(t *testing.T) {
 	if s2.idx.NumFiles() == 0 || s2.idx.NumFiles() == 4 {
 		t.Errorf("expected partial indexing, got %d files", s2.idx.NumFiles())
 	}
+	if s2.idx.NumFiles()+s2.streamCount() != 4 {
+		t.Errorf("indexed %d + stream %d != 4: over-budget files lost", s2.idx.NumFiles(), s2.streamCount())
+	}
 }
 
 func TestSkipCountersVisible(t *testing.T) {
 	root := t.TempDir()
 	write(t, filepath.Join(root, "bin.dat"), "x\x00binary")
-	write(t, filepath.Join(root, "utf16.txt"), "\xff\xfeh\x00i\x00") // BOM + NULs
+	write(t, filepath.Join(root, "utf16.txt"), "\xff\xfeh\x00i\x00 \x00n\x00e\x00e\x00d\x00l\x00e\x00U\x00") // UTF-16LE "hi needleU"
 	write(t, filepath.Join(root, "ok.go"), "plain text\n")
 	s := newStore(t, root)
 	defer s.Close()
-	if got := s.skippedBinary.Load(); got != 2 {
-		t.Errorf("skippedBinary = %d, want 2 (binary + utf16)", got)
+	// utf16 is transcoded and indexed now; only bin.dat counts as binary
+	if got := s.skippedBinary.Load(); got != 1 {
+		t.Errorf("skippedBinary = %d, want 1", got)
 	}
-	if s.idx.NumFiles() != 1 {
-		t.Errorf("NumFiles = %d, want 1", s.idx.NumFiles())
+	if s.idx.NumFiles() != 2 {
+		t.Errorf("NumFiles = %d, want 2 (ok.go + transcoded utf16.txt)", s.idx.NumFiles())
+	}
+	if m := hits(s, "needleU"); len(m) != 1 || m[0].Path != "utf16.txt" {
+		t.Errorf("utf16 content not searchable: %+v", m)
+	}
+	if sf := s.StreamList(0, nil); len(sf) != 1 || sf[0].Rel != "bin.dat" {
+		t.Errorf("binary not in stream manifest: %+v", sf)
+	}
+}
+
+// TestStreamManifestLifecycle: a file moving across the size threshold
+// must migrate between index and stream manifest, and deletion must drop
+// it from both.
+func TestStreamManifestLifecycle(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "f.txt"), "small lifeNeedle\n")
+	s := newStore(t, root)
+	defer s.Close()
+	if len(hits(s, "lifeNeedle")) != 1 || s.streamCount() != 0 {
+		t.Fatal("initial state wrong")
+	}
+	// grow past the 2MB default threshold
+	write(t, filepath.Join(root, "f.txt"), strings.Repeat("x", 3<<20))
+	waitFor(t, "file moved to stream set", func() bool {
+		return s.streamCount() == 1 && s.idx.NumFiles() == 0
+	})
+	// shrink back
+	write(t, filepath.Join(root, "f.txt"), "small again lifeNeedle\n")
+	waitFor(t, "file back in index", func() bool {
+		return s.streamCount() == 0 && len(hits(s, "lifeNeedle")) == 1
+	})
+	// delete
+	if err := os.Remove(filepath.Join(root, "f.txt")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "file gone everywhere", func() bool {
+		return s.streamCount() == 0 && s.idx.NumFiles() == 0
+	})
+}
+
+func TestDecodeUTF16(t *testing.T) {
+	le, ok := decodeUTF16([]byte("\xff\xfeh\x00i\x00"))
+	if !ok || string(le) != "hi" {
+		t.Errorf("LE decode = %q ok=%v", le, ok)
+	}
+	be, ok := decodeUTF16([]byte("\xfe\xff\x00h\x00i"))
+	if !ok || string(be) != "hi" {
+		t.Errorf("BE decode = %q ok=%v", be, ok)
+	}
+	if _, ok := decodeUTF16([]byte("plain")); ok {
+		t.Error("non-BOM content claimed as UTF-16")
+	}
+}
+
+func TestHiddenPath(t *testing.T) {
+	cases := map[string]bool{
+		"a/b.go":         false,
+		".env":           true,
+		".git/config":    true,
+		"a/.hidden/c.go": true,
+		"a/b/.dotfile":   true,
+		"a.b/c.go":       false, // dot inside a segment is not hidden
+	}
+	for p, want := range cases {
+		if got := hiddenPath(p); got != want {
+			t.Errorf("hiddenPath(%q) = %v, want %v", p, got, want)
+		}
 	}
 }
