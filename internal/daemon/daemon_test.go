@@ -149,9 +149,9 @@ func TestPersistAndReconcile(t *testing.T) {
 	}
 }
 
-func TestGitignoreRespected(t *testing.T) {
+func TestGcgrepignoreRespected(t *testing.T) {
 	root := t.TempDir()
-	write(t, filepath.Join(root, ".gitignore"), "skipme/\n*.log\n")
+	write(t, filepath.Join(root, ".gcgrepignore"), "skipme/\n*.log\n")
 	write(t, filepath.Join(root, "skipme", "x.go"), "ignoredNeedle\n")
 	write(t, filepath.Join(root, "app.log"), "ignoredNeedle\n")
 	write(t, filepath.Join(root, "ok.go"), "visibleNeedle\n")
@@ -159,7 +159,7 @@ func TestGitignoreRespected(t *testing.T) {
 	defer s.Close()
 
 	if len(hits(s, "ignoredNeedle")) != 0 {
-		t.Error("gitignored content was indexed")
+		t.Error("excluded content was indexed")
 	}
 	if len(hits(s, "visibleNeedle")) != 1 {
 		t.Error("regular file missing")

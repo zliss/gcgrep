@@ -336,9 +336,9 @@ func (s *RootStore) applyChange(abs string) {
 	if isCookie(rel) {
 		return
 	}
-	if rel == "." || rel == ".gitignore" {
-		// changed ignore rules require a reload + reconcile to apply
-		if rel == ".gitignore" {
+	if rel == "." || rel == ignore.ControlFile {
+		// changed exclusion rules require a reload + reconcile to apply
+		if rel == ignore.ControlFile {
 			s.ign = ignore.Load(s.root)
 			go func() { s.reconcile(); s.scheduleSave() }()
 		}

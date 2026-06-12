@@ -314,6 +314,11 @@ type SearchOpts struct {
 	// still passed for interface uniformity but not executed.
 	PlainLiteral string
 	FoldCase     bool
+
+	// MaxColumns truncates match line text to this many bytes (0 = no
+	// truncation). Minified single-line JSON/XML otherwise produces
+	// multi-KB output lines.
+	MaxColumns int
 }
 
 type SearchResult struct {
@@ -349,7 +354,7 @@ func (ix *Index) Search(re *regexp.Regexp, opts SearchOpts) SearchResult {
 		if opts.FilesOnly {
 			continue
 		}
-		appendLineMatches(&res, f, locs, opts.Limit)
+		appendLineMatches(&res, f, locs, opts.Limit, opts.MaxColumns)
 		if opts.Limit > 0 && len(res.Matches) >= opts.Limit {
 			res.Truncated = true
 			return res
@@ -358,7 +363,7 @@ func (ix *Index) Search(re *regexp.Regexp, opts SearchOpts) SearchResult {
 	return res
 }
 
-func appendLineMatches(res *SearchResult, f *fileEntry, locs [][]int, limit int) {
+func appendLineMatches(res *SearchResult, f *fileEntry, locs [][]int, limit, maxCols int) {
 	content := f.content
 	lineNo, pos := 1, 0
 	lastLine := -1
@@ -388,11 +393,38 @@ func appendLineMatches(res *SearchResult, f *fileEntry, locs [][]int, limit int)
 		} else {
 			end = len(content)
 		}
-		res.Matches = append(res.Matches, Match{Path: f.meta.Path, Line: lineNo, Text: string(content[start:end])})
+		text := truncateLine(content[start:end], loc[0]-start, maxCols)
+		res.Matches = append(res.Matches, Match{Path: f.meta.Path, Line: lineNo, Text: text})
 		if limit > 0 && len(res.Matches) >= limit {
 			return
 		}
 	}
+}
+
+// truncateLine caps a match line at maxCols bytes, keeping a window
+// around the match start so the hit itself stays visible even when it
+// sits deep inside a minified single-line file.
+func truncateLine(line []byte, matchOff, maxCols int) string {
+	if maxCols <= 0 || len(line) <= maxCols {
+		return string(line)
+	}
+	start := 0
+	if matchOff > maxCols/2 {
+		start = matchOff - maxCols/2
+	}
+	end := start + maxCols
+	if end > len(line) {
+		end = len(line)
+		start = end - maxCols
+	}
+	out := string(line[start:end])
+	if start > 0 {
+		out = "…" + out
+	}
+	if end < len(line) {
+		out += "…"
+	}
+	return out
 }
 
 // candidatesLocked returns file IDs that may contain the literal, via

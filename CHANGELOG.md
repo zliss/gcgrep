@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.0 (2026-06-12)
+
+- BREAKING: `.gitignore` is no longer honored. gcgrep indexes everything
+  except `.git`, binaries and >2MB files; explicit exclusions go in a
+  root `.gcgrepignore` (gitignore syntax). Rationale: gitignored
+  directories (e.g. Maven dependency sources) are often exactly what you
+  want to search, and silent ignore semantics cost user trust.
+- Match lines are truncated to a window around the hit (default 4096
+  bytes, `--max-columns N`, -1 = unlimited) — minified single-line
+  JSON/XML no longer floods output.
+- Allocation-free case-insensitive literal search (no more full-content
+  copy per file on `-i` queries).
+- Match events no longer flush the pipe per line (high-hit queries on
+  Windows named pipes were throttled by per-event flushes).
+- `done` event now reports `barrierMs` and `searchMs` for diagnosing
+  slow queries.
+
+
 ## v0.2.0 (2026-06-11)
 
 - Symbol search: `def` / `refs` / `symbols` commands for Go, Java, Python,

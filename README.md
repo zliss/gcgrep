@@ -53,8 +53,14 @@ $ gcgrep 'leaderelection' ./kubernetes     # plain grep, but 5ms warm
 - **Restart-safe**: indexes persist; restart does a stat-only reconcile
   that also catches changes made while the daemon was down.
 - **No ports**: unix domain socket (macOS/Linux) / named pipe (Windows).
-- **Zero config**: respects root `.gitignore`; always skips `.git`,
-  binaries, files > 2 MB.
+- **Indexes everything, excludes explicitly**: unlike ripgrep, gcgrep does
+  NOT silently honor `.gitignore` — gitignored dirs (Maven dependency
+  sources, build output) are often exactly what you want to search.
+  Always skips `.git`, binaries and files > 2 MB; add a `.gcgrepignore`
+  at the root (gitignore syntax) for anything else.
+- **Long-line safe**: match lines are truncated to a window around the hit
+  (default 4096 bytes, `--max-columns`), so minified one-line JSON/XML
+  doesn't flood pipes or AI token budgets.
 
 ## Install
 
@@ -93,7 +99,8 @@ a directory streams indexing progress to stderr.
   territory). It is a high-recall candidate list, comment/string-filtered.
 - Symbol extraction for Java/Python/TS is ctags-grade heuristics; Go uses
   the real parser. Other languages get text search only.
-- Root `.gitignore` only; `!negation` rules are ignored conservatively.
+- Exclusions read root `.gcgrepignore` only; `!negation` rules are ignored
+  conservatively.
 - Memory: file contents live in RAM (~1.5× source size; k8s ≈ 700 MB).
 
 ## For AI assistants
@@ -139,7 +146,7 @@ go test ./...        # unit + integration tests (index, watch, barrier, symbols)
 scripts/vmbuild.sh   # fmt/vet/test + cross-compile all platforms (on a Linux host)
 ```
 
-CI-grade coverage includes: trigram correctness, gitignore matching, live
+CI-grade coverage includes: trigram correctness, exclusion matching, live
 watching, persistence + offline-change reconciliation, a no-sleep
 read-after-write hammer test, and per-language symbol extraction suites.
 Contributions welcome — adding a language = one extractor file + tests
