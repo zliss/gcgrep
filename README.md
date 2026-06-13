@@ -50,33 +50,27 @@ Linux kernel). Default `--limit 2000`.
 
 ### Windows 11 (x64, 4 cores, Defender enabled)
 
-| | Kubernetes (380 MB) | | Linux kernel (1.5 GB) | |
-|---|---|---|---|---|
-| | **gcgrep** | **findstr** | **gcgrep** | **findstr** |
-| Cold index | 204s | — | 112s | — |
-| Warm selective | **200 ms** | 2.0s (**10×**) | **188 ms** | 5.7s (**30×**) |
-| Warm broad | **1.4s** | 2.0s (**1.4×**) | **9.5s** | 11s (**1.2×**) |
-| Idle memory | 63 MB² | — | 120 MB² | — |
-| Idle CPU | 0% | — | 0% | — |
-| Query CPU (max cores) | ~2 | ~1 | ~2 | ~1 |
-| Index on disk | 40 MB (11%) | 0 | 152 MB (10%) | 0 |
+| | Kubernetes (380 MB) | | | Linux kernel (1.5 GB) | | |
+|---|---|---|---|---|---|---|
+| | **gcgrep** | **rg** | **findstr** | **gcgrep** | **rg** | **findstr** |
+| Cold index | 38s | — | — | 112s | — | — |
+| Warm selective | **175 ms** | 1.1s | 1.9s | **181 ms** | 2.6s (**14×**) | 5.9s (**33×**) |
+| Warm broad | **1.3s** | 1.2s | 2.1s | **14.1s** | 8.1s | 10.8s |
+| Idle memory | 63 MB² | 0 | 0 | 120 MB² | 0 | 0 |
+| Idle CPU | 0% | — | — | 0% | — | — |
+| Query CPU (max cores) | ~2 | ~1 | ~1 | ~2 | ~1 | ~1 |
+| Index on disk | 40 MB (11%) | 0 | 0 | 153 MB (10%) | 0 | 0 |
 
 ### Windows 11 + inline content (`GCGREP_SHARD_INLINE_KB=64`)
 
 Files ≤ 64 KB are stored in the shard, eliminating per-file `os.Open` on NTFS.
 96.8% of source files are inlined; the remaining 3.2% large files still read from disk.
-Kubernetes files are mostly small, so inline has minimal additional effect there.
 
-| | Kubernetes (380 MB) | | Linux kernel (1.5 GB) | |
-|---|---|---|---|---|
-| | **gcgrep** | **findstr** | **gcgrep** | **findstr** |
-| Cold index | ~204s | — | 116s | — |
-| Warm selective | **~200 ms** | 2.0s (**10×**) | **155 ms** | 5.7s (**37×**) |
-| Warm broad | **~1.4s** | 2.0s (**1.4×**) | **3.6s** | 11s (**3×**) |
-| Idle memory | ~63 MB² | — | 120 MB² | — |
-| Idle CPU | 0% | — | 0% | — |
-| Query CPU (max cores) | ~2 | ~1 | ~2 | ~1 |
-| Index on disk | ~45 MB (12%) | 0 | 873 MB (58%) | 0 |
+| | Linux kernel (1.5 GB) | rg | findstr |
+|---|---|---|---|
+| Warm selective | **156 ms** | 2.6s (**17×**) | 5.9s (**38×**) |
+| Warm broad | **8.6s** | 8.1s | 10.8s |
+| Index on disk | 873 MB (58%) | 0 | 0 |
 
 **Notes:**
 - ¹ grep is a one-shot process (no daemon). 3 MB is its peak RSS during the query. gcgrep's idle memory is the daemon footprint between queries.
