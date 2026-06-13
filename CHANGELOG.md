@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.0.0 (2026-06-13)
+
+Disk shard engine for large codebases — the daemon no longer needs to hold
+all file contents in memory.
+
+- **Disk shard engine**: when source size exceeds `GCGREP_DISK_ENGINE_MB`
+  (default 512MB), the daemon builds immutable trigram shard files on disk
+  instead of holding everything in memory. Queries intersect shard posting
+  lists then verify by reading the original files. Symbol tables remain
+  in memory (~1-3% of source size).
+- **Dirty list**: file changes from the watcher are appended to a dirty
+  list (instant, no I/O). Queries combine shard results (excluding dirty
+  entries) with live disk scans of dirty files — write-after-read
+  consistency is preserved with zero latency cost.
+- **Background rebuild**: every `GCGREP_REBUILD_INTERVAL_MS` (default 20s),
+  affected shards are rebuilt and atomically swapped in.
+- `GCGREP_ENGINE=auto|mem|disk` forces engine selection.
+- `gcgrep status` shows `[disk]` for disk-engine roots and the engine type
+  in the JSON status.
+
+Verified on a 1GB / 44k-file corpus (macOS arm64):
+  - Index size: 37MB (3.7% of source)
+  - Warm p50: 29ms, p99: 32ms
+  - Daemon RSS: 416MB
+  - Write-then-read: 25/25 rounds correct
+
 ## v0.5.0 (2026-06-12)
 
 ripgrep-alignment release: nothing under a root is silently unsearchable

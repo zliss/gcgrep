@@ -27,6 +27,9 @@ type Config struct {
 	Limit            int           // GCGREP_LIMIT: default match cap, 0 = unlimited
 	ProgressInterval time.Duration // GCGREP_PROGRESS_INTERVAL_MS: indexing progress frequency
 	Priority         string        // GCGREP_PRIORITY: "low" (default) or "normal" daemon process priority
+	Engine           string        // GCGREP_ENGINE: "auto" (default), "mem", or "disk"
+	DiskEngineMB     int           // GCGREP_DISK_ENGINE_MB: auto-switch threshold (default 512)
+	RebuildInterval  time.Duration // GCGREP_REBUILD_INTERVAL_MS: shard rebuild cycle (default 20s)
 }
 
 func Default() Config {
@@ -43,6 +46,9 @@ func Default() Config {
 		Limit:            2000,
 		ProgressInterval: 300 * time.Millisecond,
 		Priority:         "low",
+		Engine:           "auto",
+		DiskEngineMB:     512,
+		RebuildInterval:  20 * time.Second,
 	}
 }
 
@@ -77,6 +83,11 @@ func Load() Config {
 	if v, ok := os.LookupEnv("GCGREP_PRIORITY"); ok && (v == "low" || v == "normal") {
 		c.Priority = v
 	}
+	if v, ok := os.LookupEnv("GCGREP_ENGINE"); ok && (v == "auto" || v == "mem" || v == "disk") {
+		c.Engine = v
+	}
+	intVar(&c.DiskEngineMB, "GCGREP_DISK_ENGINE_MB")
+	msVar(&c.RebuildInterval, "GCGREP_REBUILD_INTERVAL_MS")
 	if c.Workers < 1 {
 		c.Workers = 1
 	}
@@ -91,7 +102,7 @@ func Overrides() []string {
 	keys := []string{"GCGREP_MAX_FILESIZE_MB", "GCGREP_MAX_INDEX_MB", "GCGREP_BARRIER_TIMEOUT_MS",
 		"GCGREP_DEBOUNCE_MS", "GCGREP_SAVE_DELAY_MS", "GCGREP_WORKERS", "GCGREP_SPAWN_TIMEOUT_MS",
 		"GCGREP_DIAL_TIMEOUT_MS", "GCGREP_MAX_COLUMNS", "GCGREP_LIMIT", "GCGREP_PROGRESS_INTERVAL_MS",
-		"GCGREP_PRIORITY"}
+		"GCGREP_PRIORITY", "GCGREP_ENGINE", "GCGREP_DISK_ENGINE_MB", "GCGREP_REBUILD_INTERVAL_MS"}
 	var out []string
 	for _, k := range keys {
 		if v, ok := os.LookupEnv(k); ok {

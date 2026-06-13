@@ -2,7 +2,7 @@
 // Each request and each response event is one JSON object per line.
 package proto
 
-const Version = "0.5.0"
+const Version = "1.0.0"
 
 type Request struct {
 	Op      string   `json:"op"` // "search" | "status" | "stop"
@@ -90,6 +90,7 @@ type RootStatus struct {
 	SkippedError  int `json:"skippedError,omitempty"`  // unreadable: permissions etc.
 	// StreamFiles counts files searchable via client-side disk scan
 	// (large/binary/over-budget files are tracked, not dropped).
-	StreamFiles int  `json:"streamFiles,omitempty"`
-	Follow      bool `json:"follow,omitempty"` // -L variant store
+	StreamFiles int    `json:"streamFiles,omitempty"`
+	Follow      bool   `json:"follow,omitempty"` // -L variant store
+	Engine      string `json:"engine,omitempty"` // "mem" or "disk"
 }

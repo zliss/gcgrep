@@ -155,15 +155,26 @@ func (sv *Server) handleStatus(send func(proto.Event) error) {
 	sv.mu.Lock()
 	ev := proto.Event{Type: "status", PID: os.Getpid()}
 	for key, s := range sv.stores {
+		numFiles := 0
+		sizeMB := int(s.totalBytes.Load() >> 20)
+		engine := "mem"
+		if s.disk != nil {
+			numFiles = s.disk.NumFiles()
+			sizeMB = int(s.disk.TotalBytes() >> 20)
+			engine = "disk"
+		} else if s.idx != nil {
+			numFiles = s.idx.NumFiles()
+		}
 		ev.Roots = append(ev.Roots, proto.RootStatus{
-			Root: key.root, State: s.State(), Files: s.idx.NumFiles(),
-			SizeMB:        int(s.totalBytes.Load() >> 20),
+			Root: key.root, State: s.State(), Files: numFiles,
+			SizeMB:        sizeMB,
 			SkippedLarge:  int(s.skippedLarge.Load()),
 			SkippedBudget: int(s.skippedBudget.Load()),
 			SkippedBinary: int(s.skippedBinary.Load()),
 			SkippedError:  int(s.skippedError.Load()),
 			StreamFiles:   s.streamCount(),
 			Follow:        key.follow,
+			Engine:        engine,
 		})
 	}
 	sv.mu.Unlock()
@@ -223,7 +234,12 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error) 
 		}
 	}
 	searchStart := time.Now()
-	res := s.idx.Search(re, opts)
+	var res index.SearchResult
+	if s.disk != nil {
+		res = s.disk.Search(re, opts)
+	} else {
+		res = s.idx.Search(re, opts)
+	}
 	searchMS := time.Since(searchStart).Milliseconds()
 
 	switch {
@@ -323,7 +339,12 @@ func (sv *Server) handleSymbol(req proto.Request, send func(proto.Event) error) 
 	}
 	switch req.Op {
 	case "def":
-		hits := s.idx.Defs(req.Pattern, req.NoCase, inSubtree)
+		var hits []index.DefHit
+		if s.disk != nil {
+			hits = s.disk.Defs(req.Pattern, req.NoCase, inSubtree)
+		} else {
+			hits = s.idx.Defs(req.Pattern, req.NoCase, inSubtree)
+		}
 		sortDefHits(hits)
 		for _, h := range hits {
 			if !send1(proto.Event{Type: "match", File: strip(h.Path), Line: h.Def.Line,
@@ -333,7 +354,13 @@ func (sv *Server) handleSymbol(req proto.Request, send func(proto.Event) error) 
 		}
 	case "symbols":
 		rel := filepath.ToSlash(filepath.Clean(req.Pattern))
-		hits, found := s.idx.FileDefs(subPrefix + rel)
+		var hits []index.DefHit
+		var found bool
+		if s.disk != nil {
+			hits, found = s.disk.FileDefs(subPrefix + rel)
+		} else {
+			hits, found = s.idx.FileDefs(subPrefix + rel)
+		}
 		if !found {
 			_ = send(proto.Event{Type: "error", Msg: "file not indexed: " + req.Pattern})
 			return
@@ -345,7 +372,12 @@ func (sv *Server) handleSymbol(req proto.Request, send func(proto.Event) error) 
 			}
 		}
 	case "refs":
-		files := s.idx.FilesContaining(req.Pattern, inSubtree)
+		var files []index.FileContent
+		if s.disk != nil {
+			files = s.disk.FilesContaining(req.Pattern, inSubtree)
+		} else {
+			files = s.idx.FilesContaining(req.Pattern, inSubtree)
+		}
 		sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 		for _, fc := range files {
 			for _, r := range symbol.Refs(fc.Path, fc.Content, req.Pattern) {

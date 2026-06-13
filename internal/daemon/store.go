@@ -19,6 +19,7 @@ import (
 	"github.com/zliss/gcgrep/internal/conf"
 	"github.com/zliss/gcgrep/internal/ignore"
 	"github.com/zliss/gcgrep/internal/index"
+	"github.com/zliss/gcgrep/internal/shard"
 	"github.com/zliss/gcgrep/internal/symbol"
 	"github.com/zliss/gcgrep/internal/walkdir"
 	"github.com/zliss/gcgrep/internal/watch"
@@ -34,11 +35,13 @@ const (
 // follow=true is a separate store variant (rg -L): the walk and the
 // watcher both traverse symlinked directories.
 type RootStore struct {
-	root    string
-	follow  bool
-	idx     *index.Index
-	ign     *ignore.Matcher
-	watcher *watch.Watcher
+	root       string
+	follow     bool
+	engineType string            // "mem" or "disk"
+	idx        *index.Index      // mem engine
+	disk       *shard.DiskEngine // disk engine
+	ign        *ignore.Matcher
+	watcher    *watch.Watcher
 
 	// stream is the manifest of searchable-but-not-indexed files
 	// (large/binary/over-budget); see stream.go. In-memory only:
@@ -82,13 +85,25 @@ func newRootStore(root, cacheDir string, cfg conf.Config, follow bool) (*RootSto
 		ready:    make(chan struct{}),
 		closed:   make(chan struct{}),
 	}
-	loaded := s.loadPersisted()
-	if loaded == nil {
-		s.idx = index.New(root)
-		s.state.Store(StateIndexing)
+
+	// engine selection: decide whether to use disk shards
+	engine := cfg.Engine
+	if engine == "auto" {
+		engine = "mem" // default; may upgrade to disk in fullScan after counting
+	}
+	s.engineType = engine
+
+	if engine == "disk" {
+		s.initDiskEngine()
 	} else {
-		s.idx = loaded
-		s.state.Store(StateReconciling)
+		loaded := s.loadPersisted()
+		if loaded == nil {
+			s.idx = index.New(root)
+			s.state.Store(StateIndexing)
+		} else {
+			s.idx = loaded
+			s.state.Store(StateReconciling)
+		}
 	}
 
 	w, err := watch.New(root, s.ign.Ignored, cfg.Debounce, follow)
@@ -98,9 +113,34 @@ func newRootStore(root, cacheDir string, cfg conf.Config, follow bool) (*RootSto
 	s.watcher = w
 	go s.watchLoop()
 
-	if loaded != nil {
-		// queries wait for the reconcile pass: it is stat-only and fast,
-		// and answering from the stale index would miss offline changes
+	if engine == "disk" {
+		go func() {
+			files := s.listFiles()
+			s.total.Store(int64(len(files)))
+			shardDir := s.shardDir()
+			existing, _ := os.ReadDir(shardDir)
+			hasShards := false
+			for _, e := range existing {
+				if strings.HasSuffix(e.Name(), ".idx") {
+					hasShards = true
+					break
+				}
+			}
+			bf := make([]shard.BuildFile, len(files))
+			for i, f := range files {
+				bf[i] = shard.BuildFile{Rel: f.rel, Size: f.size, MtimeNS: f.mtimeNS}
+			}
+			if hasShards {
+				s.state.Store(StateReconciling)
+				s.disk.Reconcile(bf)
+			} else {
+				s.state.Store(StateIndexing)
+				_ = s.disk.FullBuild(bf, func(n int) { s.indexed.Add(int64(n)) })
+			}
+			s.state.Store(StateReady)
+			close(s.ready)
+		}()
+	} else if s.idx != nil && s.state.Load().(string) == StateReconciling {
 		go func() {
 			s.reconcile()
 			s.state.Store(StateReady)
@@ -116,6 +156,25 @@ func newRootStore(root, cacheDir string, cfg conf.Config, follow bool) (*RootSto
 	}
 	return s, nil
 }
+
+func (s *RootStore) initDiskEngine() {
+	dir := s.shardDir()
+	_ = os.MkdirAll(dir, 0o755)
+	s.disk = shard.NewDiskEngine(s.root, dir, s.cfg.Workers, s.cfg.RebuildInterval)
+	s.state.Store(StateIndexing)
+}
+
+func (s *RootStore) shardDir() string {
+	key := s.root
+	if s.follow {
+		key += "\x00follow"
+	}
+	sum := sha256.Sum256([]byte(key))
+	return filepath.Join(s.cacheDir, "shards-"+hex.EncodeToString(sum[:8]))
+}
+
+// IsDisk reports whether this store uses the disk shard engine.
+func (s *RootStore) IsDisk() bool { return s.engineType == "disk" }
 
 func (s *RootStore) State() string { return s.state.Load().(string) }
 
@@ -139,7 +198,12 @@ func (s *RootStore) Close() {
 	}
 	close(s.closed)
 	s.watcher.Close()
-	s.save()
+	if s.disk != nil {
+		s.disk.Close()
+	}
+	if s.idx != nil {
+		s.save()
+	}
 }
 
 // ---- scanning ----
@@ -178,6 +242,25 @@ func (s *RootStore) listFiles() []fileStat {
 func (s *RootStore) fullScan() {
 	files := s.listFiles()
 	s.total.Store(int64(len(files)))
+	// auto engine selection: check total source size
+	if s.cfg.Engine == "auto" {
+		var totalMB int64
+		for _, f := range files {
+			totalMB += f.size
+		}
+		totalMB >>= 20
+		if totalMB >= int64(s.cfg.DiskEngineMB) {
+			log.Printf("source size %dMB >= GCGREP_DISK_ENGINE_MB=%d: switching to disk engine for %s", totalMB, s.cfg.DiskEngineMB, s.root)
+			s.engineType = "disk"
+			s.initDiskEngine()
+			bf := make([]shard.BuildFile, len(files))
+			for i, f := range files {
+				bf[i] = shard.BuildFile{Rel: f.rel, Size: f.size, MtimeNS: f.mtimeNS}
+			}
+			_ = s.disk.FullBuild(bf, func(n int) { s.indexed.Add(int64(n)) })
+			return
+		}
+	}
 	rels := make([]string, len(files))
 	for i, f := range files {
 		rels[i] = f.rel
@@ -435,6 +518,30 @@ func (s *RootStore) applyChange(abs string) {
 		return
 	}
 	fi, err := os.Lstat(abs)
+	if s.disk != nil {
+		// disk engine: mark dirty, the rebuild cycle handles the rest
+		switch {
+		case err != nil:
+			if s.ign.Ignored(rel, true) && s.ign.Ignored(rel, false) {
+				return
+			}
+			s.disk.MarkDeleted(rel)
+			s.disk.MarkDeletedPrefix(rel)
+		case fi.IsDir():
+			if s.ign.Ignored(rel, true) {
+				return
+			}
+			for _, sub := range s.listUnder(rel) {
+				s.disk.MarkDirty(sub)
+			}
+		case fi.Mode().IsRegular():
+			if s.ign.Ignored(rel, false) {
+				return
+			}
+			s.disk.MarkDirty(rel)
+		}
+		return
+	}
 	switch {
 	case err != nil: // removed (or inaccessible): drop file or subtree
 		if s.ign.Ignored(rel, true) && s.ign.Ignored(rel, false) {
@@ -448,7 +555,6 @@ func (s *RootStore) applyChange(abs string) {
 		if s.ign.Ignored(rel, true) {
 			return
 		}
-		// new or moved-in directory: index its contents
 		for _, sub := range s.listUnder(rel) {
 			s.indexFile(sub)
 		}

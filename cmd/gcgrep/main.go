@@ -473,7 +473,10 @@ func cmdSimple(op string) int {
 			}
 			mode := ""
 			if r.Follow {
-				mode = " (-L)"
+				mode += " (-L)"
+			}
+			if r.Engine == "disk" {
+				mode += " [disk]"
 			}
 			fmt.Printf("  %s%s  [%s]  %d files, %dMB%s\n", r.Root, mode, r.State, r.Files, r.SizeMB, extra)
 		}
