@@ -65,12 +65,14 @@ Linux kernel). Default `--limit 2000`.
 
 Files ≤ 64 KB are stored in the shard, eliminating per-file `os.Open` on NTFS.
 96.8% of source files are inlined; the remaining 3.2% large files still read from disk.
+Disabled by default — enable on Windows when broad queries are slow.
 
-| | Linux kernel (1.5 GB) | rg | findstr |
-|---|---|---|---|
-| Warm selective | **156 ms** | 2.6s (**17×**) | 5.9s (**38×**) |
-| Warm broad | **8.6s** | 8.1s | 10.8s |
-| Index on disk | 873 MB (58%) | 0 | 0 |
+| | Kubernetes (380 MB) | | Linux kernel (1.5 GB) | |
+|---|---|---|---|---|
+| | **gcgrep inline** | **rg** | **gcgrep inline** | **rg** |
+| Warm selective | **157 ms** | 1.1s (**7×**) | **156 ms** | 2.6s (**17×**) |
+| Warm broad | **826 ms** | 1.2s (**1.5×**) | **8.6s** | 8.1s |
+| Index on disk | 180 MB (47%) | 0 | 873 MB (58%) | 0 |
 
 **Notes:**
 - ¹ grep is a one-shot process (no daemon). 3 MB is its peak RSS during the query. gcgrep's idle memory is the daemon footprint between queries.
