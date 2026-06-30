@@ -352,7 +352,7 @@ func (s *Shard) FileDefs(fileID int) []symbol.Def {
 			kindLen, p2 := readUvarint(s.data, p)
 			p2 += int(kindLen) // kind
 			containerLen, p3 := readUvarint(s.data, p2)
-			p3 += int(containerLen) // container
+			p3 += int(containerLen)          // container
 			_, p4 := readUvarint(s.data, p3) // line
 			pos = p4
 		}
