@@ -384,6 +384,210 @@ func TestDecodeUTF16(t *testing.T) {
 	}
 }
 
+func TestExcludeIncludeMatcher(t *testing.T) {
+	// no patterns → nil
+	if fn, err := excludeIncludeMatcher(nil, nil); fn != nil || err != nil {
+		t.Fatalf("empty should return nil, got fn=%p err=%v", fn, err)
+	}
+
+	// exclude only
+	fn, err := excludeIncludeMatcher([]string{"*.log", "vendor/*"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fn("app.log") {
+		t.Error("*.log should be excluded")
+	}
+	if fn("vendor/lib.go") {
+		t.Error("vendor/* should be excluded")
+	}
+	if !fn("main.go") {
+		t.Error("main.go should pass")
+	}
+
+	// include overrides exclude
+	fn2, _ := excludeIncludeMatcher([]string{"*.log"}, []string{"important.log"})
+	if !fn2("important.log") {
+		t.Error("include should override exclude")
+	}
+	if fn2("debug.log") {
+		t.Error("non-included .log should be excluded")
+	}
+	if !fn2("main.go") {
+		t.Error("unmatched file should pass")
+	}
+}
+
+func TestGcgrepExcludeEnv(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "ok.go"), "visibleExcNeedle\n")
+	write(t, filepath.Join(root, "gen", "out.go"), "excludedExcNeedle\n")
+
+	cfg := conf.Default()
+	cfg.Exclude = []string{"gen/"}
+	s, err := newRootStore(root, t.TempDir(), cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.WaitReady()
+
+	if len(hits(s, "visibleExcNeedle")) != 1 {
+		t.Error("normal file missing")
+	}
+	if len(hits(s, "excludedExcNeedle")) != 0 {
+		t.Error("GCGREP_EXCLUDE dir content was indexed")
+	}
+}
+
+func TestGitignoreIntegration(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, ".gitignore"), "*.gen.go\nbuild/\n")
+	write(t, filepath.Join(root, "main.go"), "gitignVisibleNeedle\n")
+	write(t, filepath.Join(root, "types.gen.go"), "gitignHiddenNeedle\n")
+	write(t, filepath.Join(root, "build", "out.js"), "gitignBuildNeedle\n")
+
+	cfg := conf.Default()
+	cfg.Gitignore = true
+	s, err := newRootStore(root, t.TempDir(), cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.WaitReady()
+
+	if len(hits(s, "gitignVisibleNeedle")) != 1 {
+		t.Error("normal file missing with gitignore on")
+	}
+	if len(hits(s, "gitignHiddenNeedle")) != 0 {
+		t.Error(".gitignore pattern not respected during indexing")
+	}
+	if len(hits(s, "gitignBuildNeedle")) != 0 {
+		t.Error(".gitignore dir pattern not respected during indexing")
+	}
+}
+
+func TestNestedRootCheck(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(sub, "a.go"), "content\n")
+
+	cfg := conf.Default()
+	sv := NewServer(t.TempDir(), cfg)
+
+	// index sub first
+	s1, err := sv.store(sub, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.WaitReady()
+
+	// indexing parent should fail
+	_, err = sv.store(root, false, false)
+	if err == nil {
+		t.Fatal("expected nested root error")
+	}
+	if !strings.Contains(err.Error(), "sub-root") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// --allow-nested bypasses
+	s2, err := sv.store(root, false, true)
+	if err != nil {
+		t.Fatalf("allow-nested should bypass: %v", err)
+	}
+	s2.WaitReady()
+
+	// cleanup
+	for _, s := range []*RootStore{s1, s2} {
+		s.Close()
+	}
+}
+
+func TestCacheInfoAndDeleteCache(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "a.go"), "cacheTestNeedle\n")
+	cache := t.TempDir()
+	s, err := newRootStore(root, cache, conf.Default(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.WaitReady()
+	s.save()
+
+	dir, size := s.CacheInfo()
+	if dir == "" {
+		t.Error("CacheInfo returned empty dir")
+	}
+	if size <= 0 {
+		t.Errorf("CacheInfo size=%d, want >0", size)
+	}
+
+	indexPath := s.indexPath()
+	s.Close()
+
+	// index file should exist
+	if _, err := os.Stat(indexPath); err != nil {
+		t.Fatalf("index file missing before delete: %v", err)
+	}
+
+	s2, _ := newRootStore(root, cache, conf.Default(), false)
+	s2.WaitReady()
+	s2.Close()
+	s2.DeleteCache()
+
+	if _, err := os.Stat(indexPath); !os.IsNotExist(err) {
+		t.Error("DeleteCache did not remove index file")
+	}
+}
+
+func TestForgetViaServer(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "a.go"), "forgetNeedle\n")
+
+	cfg := conf.Default()
+	cache := t.TempDir()
+	sv := NewServer(cache, cfg)
+
+	s, err := sv.store(root, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.WaitReady()
+
+	// verify store exists
+	sv.mu.Lock()
+	count := len(sv.stores)
+	sv.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("stores count = %d, want 1", count)
+	}
+
+	// simulate forget
+	sv.mu.Lock()
+	var foundKey storeKey
+	for key := range sv.stores {
+		if key.root == root {
+			foundKey = key
+			break
+		}
+	}
+	delete(sv.stores, foundKey)
+	sv.mu.Unlock()
+	s.Close()
+	s.DeleteCache()
+
+	sv.mu.Lock()
+	count = len(sv.stores)
+	sv.mu.Unlock()
+	if count != 0 {
+		t.Fatalf("stores count after forget = %d, want 0", count)
+	}
+}
+
 func TestHiddenPath(t *testing.T) {
 	cases := map[string]bool{
 		"a/b.go":         false,
