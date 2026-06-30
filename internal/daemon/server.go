@@ -6,6 +6,7 @@ package daemon
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/zliss/gcgrep/internal/conf"
+	"github.com/zliss/gcgrep/internal/ignore"
 	"github.com/zliss/gcgrep/internal/index"
 	"github.com/zliss/gcgrep/internal/proto"
 	"github.com/zliss/gcgrep/internal/symbol"
@@ -97,12 +99,29 @@ func (sv *Server) doStop() {
 
 // store returns the RootStore covering path: an existing root that equals
 // or contains path is reused; otherwise a new store is created for path.
-func (sv *Server) store(path string, follow bool) (*RootStore, error) {
+// allowNested bypasses the nested-root check.
+func (sv *Server) store(path string, follow, allowNested bool) (*RootStore, error) {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
 	for key, s := range sv.stores {
 		if key.follow == follow && (path == key.root || strings.HasPrefix(path, key.root+string(filepath.Separator))) {
 			return s, nil
+		}
+	}
+	if !allowNested {
+		var nested []string
+		sep := string(filepath.Separator)
+		for key := range sv.stores {
+			if key.follow != follow {
+				continue
+			}
+			if strings.HasPrefix(key.root, path+sep) {
+				nested = append(nested, key.root)
+			}
+		}
+		if len(nested) > 0 {
+			sort.Strings(nested)
+			return nil, fmt.Errorf("root %s contains already-indexed sub-root(s): %s; use 'gcgrep forget' to remove them or --allow-nested to proceed", path, strings.Join(nested, ", "))
 		}
 	}
 	s, err := newRootStore(path, sv.cacheDir, sv.cfg, follow)
@@ -144,6 +163,8 @@ func (sv *Server) handle(conn net.Conn) {
 		sv.handleSymbol(req, send)
 	case "status":
 		sv.handleStatus(send)
+	case "forget":
+		sv.handleForget(req, send)
 	case "stop":
 		_ = send(proto.Event{Type: "done"})
 		sv.stopAll()
@@ -166,6 +187,7 @@ func (sv *Server) handleStatus(send func(proto.Event) error) {
 		} else if s.idx != nil {
 			numFiles = s.idx.NumFiles()
 		}
+		cacheDir, cacheSizeBytes := s.CacheInfo()
 		ev.Roots = append(ev.Roots, proto.RootStatus{
 			Root: key.root, State: s.State(), Files: numFiles,
 			SizeMB:        sizeMB,
@@ -176,6 +198,8 @@ func (sv *Server) handleStatus(send func(proto.Event) error) {
 			StreamFiles:   s.streamCount(),
 			Follow:        key.follow,
 			Engine:        engine,
+			CacheDir:      cacheDir,
+			CacheSizeMB:   int(cacheSizeBytes >> 20),
 		})
 	}
 	sv.mu.Unlock()
@@ -218,9 +242,16 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error, 
 		_ = send(proto.Event{Type: "error", Msg: "bad glob: " + perr.Error()})
 		return
 	}
-	// path filters compose over the request-relative path: glob, then the
-	// hidden filter (dot segments skipped unless --hidden, rg default)
+	exIn, eierr := excludeIncludeMatcher(req.Exclude, req.Include)
+	if eierr != nil {
+		_ = send(proto.Event{Type: "error", Msg: "bad exclude/include glob: " + eierr.Error()})
+		return
+	}
 	reqOK := pm
+	if exIn != nil {
+		inner := reqOK
+		reqOK = func(p string) bool { return exIn(p) && (inner == nil || inner(p)) }
+	}
 	if !req.Hidden {
 		inner := reqOK
 		reqOK = func(p string) bool { return !hiddenPath(p) && (inner == nil || inner(p)) }
@@ -232,6 +263,13 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error, 
 				return false
 			}
 			return reqOK == nil || reqOK(strip(p))
+		}
+	}
+	if req.Gitignore {
+		gitTree := ignore.NewGitignoreTree(s.root)
+		inner := opts.PathMatch
+		opts.PathMatch = func(p string) bool {
+			return !gitTree.Ignored(p, false) && (inner == nil || inner(p))
 		}
 	}
 	searchStart := time.Now()
@@ -302,7 +340,7 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error, 
 // and the subtree prefix ("" when req.Root is the store root), or ok=false
 // if an error was already sent / the client left.
 func (sv *Server) prologue(req proto.Request, send func(proto.Event) error) (s *RootStore, subPrefix string, barrierMS int64, ok bool) {
-	s, err := sv.store(req.Root, req.Follow)
+	s, err := sv.store(req.Root, req.Follow, req.AllowNested)
 	if err != nil {
 		_ = send(proto.Event{Type: "error", Msg: err.Error()})
 		return nil, "", 0, false
@@ -414,6 +452,30 @@ func sortDefHits(hits []index.DefHit) {
 	})
 }
 
+func (sv *Server) handleForget(req proto.Request, send func(proto.Event) error) {
+	sv.mu.Lock()
+	var found *RootStore
+	var foundKey storeKey
+	for key, s := range sv.stores {
+		if key.root == req.Root {
+			found = s
+			foundKey = key
+			break
+		}
+	}
+	if found != nil {
+		delete(sv.stores, foundKey)
+	}
+	sv.mu.Unlock()
+	if found != nil {
+		found.Close()
+		found.DeleteCache()
+		_ = send(proto.Event{Type: "done", Msg: "forgot " + req.Root})
+	} else {
+		_ = send(proto.Event{Type: "done", Msg: "not indexed: " + req.Root})
+	}
+}
+
 // streamUntilReady emits progress events while the initial scan runs.
 // Returns false if the client disconnected.
 func streamUntilReady(s *RootStore, send func(proto.Event) error) bool {
@@ -485,6 +547,48 @@ func globMatcher(globs []string) (func(string) bool, error) {
 			}
 		}
 		return false
+	}, nil
+}
+
+// excludeIncludeMatcher builds a path filter from --exclude and --include
+// globs. Include overrides exclude: a path matching both is kept.
+func excludeIncludeMatcher(exclude, include []string) (func(string) bool, error) {
+	if len(exclude) == 0 && len(include) == 0 {
+		return nil, nil
+	}
+	for _, g := range exclude {
+		if _, err := filepath.Match(g, "x"); err != nil {
+			return nil, err
+		}
+	}
+	for _, g := range include {
+		if _, err := filepath.Match(g, "x"); err != nil {
+			return nil, err
+		}
+	}
+	matchAny := func(globs []string, p string) bool {
+		base := p
+		if i := strings.LastIndexByte(p, '/'); i >= 0 {
+			base = p[i+1:]
+		}
+		for _, g := range globs {
+			if ok, _ := filepath.Match(g, p); ok {
+				return true
+			}
+			if ok, _ := filepath.Match(g, base); ok {
+				return true
+			}
+		}
+		return false
+	}
+	return func(p string) bool {
+		if len(include) > 0 && matchAny(include, p) {
+			return true
+		}
+		if len(exclude) > 0 && matchAny(exclude, p) {
+			return false
+		}
+		return true
 	}, nil
 }
 

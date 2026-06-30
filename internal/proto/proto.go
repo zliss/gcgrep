@@ -2,7 +2,7 @@
 // Each request and each response event is one JSON object per line.
 package proto
 
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 type Request struct {
 	Op      string   `json:"op"` // "search" | "status" | "stop"
@@ -20,9 +20,13 @@ type Request struct {
 	// single-line JSON/XML.
 	MaxColumns int `json:"maxcols,omitempty"`
 
-	Hidden bool `json:"hidden,omitempty"` // include dot-files/dirs (rg --hidden)
+	Exclude []string `json:"exclude,omitempty"` // query-level glob exclusions
+	Include []string `json:"include,omitempty"` // query-level glob inclusions (override exclude)
+	Gitignore bool   `json:"gitignore,omitempty"` // honor .gitignore files (default off)
+	Hidden    bool   `json:"hidden,omitempty"`    // include dot-files/dirs (rg --hidden)
 	Text   bool `json:"text,omitempty"`   // search binary files as text (rg -a)
 	Follow bool `json:"follow,omitempty"` // follow symlinks (rg -L); selects a follow-variant store
+	AllowNested bool `json:"allowNested,omitempty"` // skip nested-root check
 	// MaxFilesize, in bytes, excludes larger files from the search
 	// (indexed and stream set alike). 0 = no limit (rg --max-filesize).
 	MaxFilesize int64 `json:"maxFilesize,omitempty"`
@@ -93,4 +97,6 @@ type RootStatus struct {
 	StreamFiles int    `json:"streamFiles,omitempty"`
 	Follow      bool   `json:"follow,omitempty"` // -L variant store
 	Engine      string `json:"engine,omitempty"` // "mem" or "disk"
+	CacheDir    string `json:"cacheDir,omitempty"`
+	CacheSizeMB int    `json:"cacheSizeMb,omitempty"`
 }

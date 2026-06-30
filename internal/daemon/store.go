@@ -42,6 +42,7 @@ type RootStore struct {
 	idx        *index.Index      // mem engine
 	disk       *shard.DiskEngine // disk engine
 	ign        *ignore.Matcher
+	gitTree    *ignore.GitignoreTree // nil unless GCGREP_GITIGNORE=1
 	watcher    *watch.Watcher
 
 	// stream is the manifest of searchable-but-not-indexed files
@@ -76,11 +77,18 @@ type RootStore struct {
 // reconcile/scan pass (so changes during the pass are not lost), then
 // builds or reconciles in the background.
 func newRootStore(root, cacheDir string, cfg conf.Config, follow bool) (*RootStore, error) {
+	ign := ignore.Load(root)
+	ign.AddPatterns(cfg.Exclude)
+	var gitTree *ignore.GitignoreTree
+	if cfg.Gitignore {
+		gitTree = ignore.NewGitignoreTree(root)
+	}
 	s := &RootStore{
 		root:     root,
 		follow:   follow,
 		cfg:      cfg,
-		ign:      ignore.Load(root),
+		ign:      ign,
+		gitTree:  gitTree,
 		cacheDir: cacheDir,
 		stream:   make(map[string]streamEntry),
 		ready:    make(chan struct{}),
@@ -107,7 +115,7 @@ func newRootStore(root, cacheDir string, cfg conf.Config, follow bool) (*RootSto
 		}
 	}
 
-	w, err := watch.New(root, s.ign.Ignored, cfg.Debounce, follow)
+	w, err := watch.New(root, s.ignored, cfg.Debounce, follow)
 	if err != nil {
 		return nil, fmt.Errorf("watch %s: %w", root, err)
 	}
@@ -189,6 +197,44 @@ func (s *RootStore) shardDir() string {
 // IsDisk reports whether this store uses the disk shard engine.
 func (s *RootStore) IsDisk() bool { return s.engineType == "disk" }
 
+// CacheInfo returns the cache directory and its total size in bytes.
+func (s *RootStore) CacheInfo() (dir string, sizeBytes int64) {
+	if s.disk != nil {
+		dir = s.shardDir()
+		sizeBytes = dirSize(dir)
+	}
+	if p := s.indexPath(); dir == "" {
+		dir = filepath.Dir(p)
+	}
+	if fi, err := os.Stat(s.indexPath()); err == nil {
+		sizeBytes += fi.Size()
+	}
+	return dir, sizeBytes
+}
+
+// DeleteCache removes all persisted index files for this root.
+func (s *RootStore) DeleteCache() {
+	_ = os.Remove(s.indexPath())
+	_ = os.Remove(s.indexPath() + ".tmp")
+	if dir := s.shardDir(); dir != "" {
+		_ = os.RemoveAll(dir)
+	}
+}
+
+func dirSize(path string) int64 {
+	var total int64
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return 0
+	}
+	for _, e := range entries {
+		if fi, err := e.Info(); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
+}
+
 func (s *RootStore) State() string { return s.state.Load().(string) }
 
 func (s *RootStore) Progress() (indexed, total int) {
@@ -238,12 +284,12 @@ func (s *RootStore) listFiles() []fileStat {
 		}
 		rel = filepath.ToSlash(rel)
 		if isDir {
-			if s.ign.Ignored(rel, true) {
+			if s.ignored(rel, true) {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		if s.ign.Ignored(rel, false) || isCookie(rel) {
+		if s.ignored(rel, false) || isCookie(rel) {
 			return nil
 		}
 		out = append(out, fileStat{rel: rel, size: fi.Size(), mtimeNS: fi.ModTime().UnixNano()})
@@ -452,6 +498,11 @@ func (s *RootStore) removeTracked(rel string) {
 	s.streamDelete(rel)
 }
 
+// ignored reports whether a relative path is excluded by any mechanism.
+func (s *RootStore) ignored(rel string, isDir bool) bool {
+	return s.ign.Ignored(rel, isDir) || (s.gitTree != nil && s.gitTree.Ignored(rel, isDir))
+}
+
 func isCookie(rel string) bool {
 	base := rel
 	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
@@ -547,7 +598,9 @@ func (s *RootStore) applyChange(abs string) {
 	if rel == "." || rel == ignore.ControlFile {
 		// changed exclusion rules require a reload + reconcile to apply
 		if rel == ignore.ControlFile {
-			s.ign = ignore.Load(s.root)
+			ign := ignore.Load(s.root)
+			ign.AddPatterns(s.cfg.Exclude)
+			s.ign = ign
 			go func() { s.reconcile(); s.scheduleSave() }()
 		}
 		return
@@ -557,20 +610,20 @@ func (s *RootStore) applyChange(abs string) {
 		// disk engine: mark dirty, the rebuild cycle handles the rest
 		switch {
 		case err != nil:
-			if s.ign.Ignored(rel, true) && s.ign.Ignored(rel, false) {
+			if s.ignored(rel, true) && s.ignored(rel, false) {
 				return
 			}
 			s.disk.MarkDeleted(rel)
 			s.disk.MarkDeletedPrefix(rel)
 		case fi.IsDir():
-			if s.ign.Ignored(rel, true) {
+			if s.ignored(rel, true) {
 				return
 			}
 			for _, sub := range s.listUnder(rel) {
 				s.disk.MarkDirty(sub)
 			}
 		case fi.Mode().IsRegular():
-			if s.ign.Ignored(rel, false) {
+			if s.ignored(rel, false) {
 				return
 			}
 			s.disk.MarkDirty(rel)
@@ -579,7 +632,7 @@ func (s *RootStore) applyChange(abs string) {
 	}
 	switch {
 	case err != nil: // removed (or inaccessible): drop file or subtree
-		if s.ign.Ignored(rel, true) && s.ign.Ignored(rel, false) {
+		if s.ignored(rel, true) && s.ignored(rel, false) {
 			return
 		}
 		s.idx.Remove(rel)
@@ -587,14 +640,14 @@ func (s *RootStore) applyChange(abs string) {
 		s.streamDelete(rel)
 		s.streamDeletePrefix(rel)
 	case fi.IsDir():
-		if s.ign.Ignored(rel, true) {
+		if s.ignored(rel, true) {
 			return
 		}
 		for _, sub := range s.listUnder(rel) {
 			s.indexFile(sub)
 		}
 	case fi.Mode().IsRegular():
-		if s.ign.Ignored(rel, false) {
+		if s.ignored(rel, false) {
 			return
 		}
 		s.indexFile(rel)
@@ -612,12 +665,12 @@ func (s *RootStore) listUnder(relDir string) []string {
 		}
 		rel = filepath.ToSlash(rel)
 		if isDir {
-			if rel != relDir && s.ign.Ignored(rel, true) {
+			if rel != relDir && s.ignored(rel, true) {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		if !s.ign.Ignored(rel, false) {
+		if !s.ignored(rel, false) {
 			out = append(out, rel)
 		}
 		return nil

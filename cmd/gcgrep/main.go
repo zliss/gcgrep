@@ -66,6 +66,8 @@ func run() int {
 			return cmdSymbol(args[0], args[1:])
 		case "daemon":
 			return cmdDaemon()
+		case "forget":
+			return cmdForget(args[1:])
 		case "stop":
 			return cmdSimple("stop")
 		case "status":
@@ -90,6 +92,7 @@ Usage:
   gcgrep refs NAME [PATH]           find candidate references/calls by name
   gcgrep symbols FILE               list all definitions in FILE
   gcgrep status                     show daemon state and indexed roots
+  gcgrep forget PATH...             delete index for the given root(s)
   gcgrep stop                       stop the daemon (indexes are persisted)
   gcgrep daemon                     run the daemon in the foreground
 
@@ -103,10 +106,14 @@ Options:
   -l            print only names of files with matches
   -c            print match counts per file
   -g GLOB       only search files matching GLOB (repeatable)
+  --exclude GLOB  exclude files matching GLOB (repeatable; --include wins)
+  --include GLOB  include files matching GLOB even if excluded (repeatable)
+  --gitignore   honor .gitignore files (off by default; see GCGREP_GITIGNORE)
   --hidden      search hidden files and directories (skipped by default)
   -a, --text    search binary files as if they were text
   -L, --follow  follow symbolic links (separate index per mode)
   --max-filesize SIZE  skip files larger than SIZE (K/M/G suffixes)
+  --allow-nested  allow indexing a root that contains sub-roots
   --json        output one JSON object per event (machine-readable)
   --limit N     stop after N matching lines (default 2000, 0 = no limit)
   --no-sync     skip the read-after-write barrier (faster, may miss writes
@@ -119,7 +126,9 @@ Tunables via env (daemon logs effective overrides): GCGREP_MAX_FILESIZE_MB
 (default 2), GCGREP_MAX_INDEX_MB (0=unlimited), GCGREP_BARRIER_TIMEOUT_MS,
 GCGREP_DEBOUNCE_MS, GCGREP_SAVE_DELAY_MS, GCGREP_WORKERS, GCGREP_LIMIT,
 GCGREP_MAX_COLUMNS, GCGREP_SPAWN_TIMEOUT_MS, GCGREP_DIAL_TIMEOUT_MS,
-GCGREP_PRIORITY (low|normal, daemon process priority, default low).
+GCGREP_PRIORITY (low|normal, daemon process priority, default low),
+GCGREP_EXCLUDE (comma-separated glob patterns excluded from indexing),
+GCGREP_GITIGNORE (1 or true: honor .gitignore files during indexing).
 
 Files over GCGREP_MAX_FILESIZE_MB, binary files and files past the index
 budget remain searchable: the daemon tracks them and the client scans
@@ -168,21 +177,25 @@ func parseArgs(args []string) (cliOpts, error) {
 	fs := flag.NewFlagSet("gcgrep", flag.ContinueOnError)
 	fs.Usage = usage
 	o := cliOpts{}
-	var globs multiFlag
+	var globs, excludes, includes multiFlag
 	fs.BoolVar(&o.req.NoCase, "i", false, "")
 	fs.BoolVar(&o.req.Fixed, "F", false, "")
 	fs.BoolVar(&o.req.Files, "l", false, "")
 	fs.BoolVar(&o.req.Count, "c", false, "")
 	fs.Var(&globs, "g", "")
+	fs.Var(&excludes, "exclude", "")
+	fs.Var(&includes, "include", "")
 	fs.BoolVar(&o.jsonOut, "json", false, "")
 	fs.IntVar(&o.req.Limit, "limit", cfg.Limit, "")
 	fs.BoolVar(&o.req.NoSync, "no-sync", false, "")
 	fs.IntVar(&o.req.MaxColumns, "max-columns", 0, "")
+	fs.BoolVar(&o.req.Gitignore, "gitignore", false, "")
 	fs.BoolVar(&o.req.Hidden, "hidden", false, "")
 	fs.BoolVar(&o.req.Text, "a", false, "")
 	fs.BoolVar(&o.req.Text, "text", false, "")
 	fs.BoolVar(&o.req.Follow, "L", false, "")
 	fs.BoolVar(&o.req.Follow, "follow", false, "")
+	fs.BoolVar(&o.req.AllowNested, "allow-nested", false, "")
 	var maxFilesize string
 	fs.StringVar(&maxFilesize, "max-filesize", "", "")
 	if err := fs.Parse(args); err != nil {
@@ -200,6 +213,8 @@ func parseArgs(args []string) (cliOpts, error) {
 	o.req.Op = "search"
 	o.req.Pattern = rest[0]
 	o.req.Globs = globs
+	o.req.Exclude = excludes
+	o.req.Include = includes
 	o.pathArg = "."
 	if len(rest) == 2 {
 		o.pathArg = rest[1]
@@ -484,6 +499,9 @@ func cmdSimple(op string) int {
 			if r.Engine == "disk" {
 				mode += " [disk]"
 			}
+			if r.CacheDir != "" {
+				extra += fmt.Sprintf("  cache: %s (%dMB)", r.CacheDir, r.CacheSizeMB)
+			}
 			fmt.Printf("  %s%s  [%s]  %d files, %dMB%s\n", r.Root, mode, r.State, r.Files, r.SizeMB, extra)
 		}
 		if len(ev.Roots) == 0 {
@@ -496,6 +514,44 @@ func cmdSimple(op string) int {
 		return 2
 	}
 	return 0
+}
+
+func cmdForget(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "gcgrep forget: expected one or more paths")
+		return 2
+	}
+	rc := 0
+	for _, p := range args {
+		abs, aerr := filepath.Abs(p)
+		if aerr != nil {
+			fmt.Fprintf(os.Stderr, "gcgrep forget: %v\n", aerr)
+			rc = 2
+			continue
+		}
+		if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+			abs = resolved
+		}
+		conn, err := ipc.Dial(cfg.DialTimeout)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gcgrep: daemon not running")
+			return 1
+		}
+		if err := json.NewEncoder(conn).Encode(&proto.Request{Op: "forget", Root: abs}); err != nil {
+			conn.Close()
+			fmt.Fprintf(os.Stderr, "gcgrep forget: %v\n", err)
+			return 2
+		}
+		var ev proto.Event
+		if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&ev); err != nil {
+			conn.Close()
+			fmt.Fprintf(os.Stderr, "gcgrep forget: %v\n", err)
+			return 2
+		}
+		conn.Close()
+		fmt.Println(ev.Msg)
+	}
+	return rc
 }
 
 // connectOrSpawn dials the daemon, starting it on demand. Concurrent

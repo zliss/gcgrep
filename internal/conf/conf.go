@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -37,6 +38,8 @@ type Config struct {
 	SearchWorkers    int           // GCGREP_SEARCH_WORKERS: parallel search goroutines (default 2)
 	MemoryLimitMB    int           // GCGREP_MEMORY_LIMIT_MB: Go soft memory limit for disk engine daemon (default 100)
 	ShardInlineKB    int           // GCGREP_SHARD_INLINE_KB: inline file content in shard for files ≤ this size (Windows only, default 0)
+	Exclude          []string      // GCGREP_EXCLUDE: comma-separated glob patterns excluded from indexing and search
+	Gitignore        bool          // GCGREP_GITIGNORE: honor .gitignore files during indexing (default false)
 }
 
 func Default() Config {
@@ -109,6 +112,12 @@ func Load() Config {
 	intVar(&c.SearchWorkers, "GCGREP_SEARCH_WORKERS")
 	intVar(&c.MemoryLimitMB, "GCGREP_MEMORY_LIMIT_MB")
 	intVar(&c.ShardInlineKB, "GCGREP_SHARD_INLINE_KB")
+	if v, ok := os.LookupEnv("GCGREP_GITIGNORE"); ok && (v == "1" || v == "true") {
+		c.Gitignore = true
+	}
+	if v, ok := os.LookupEnv("GCGREP_EXCLUDE"); ok && v != "" {
+		c.Exclude = strings.Split(v, ",")
+	}
 	if c.Workers < 1 {
 		c.Workers = 1
 	}
@@ -132,7 +141,7 @@ func Overrides() []string {
 		"GCGREP_PRIORITY", "GCGREP_ENGINE", "GCGREP_DISK_ENGINE_MB", "GCGREP_REBUILD_INTERVAL_MS",
 		"GCGREP_SHARD_TARGET_MB", "GCGREP_SHARD_MIN_MB", "GCGREP_SHARD_MAX_MB",
 		"GCGREP_REBUILD_THRESHOLD", "GCGREP_SEARCH_WORKERS", "GCGREP_MEMORY_LIMIT_MB",
-		"GCGREP_SHARD_INLINE_KB"}
+		"GCGREP_SHARD_INLINE_KB", "GCGREP_EXCLUDE", "GCGREP_GITIGNORE"}
 	var out []string
 	for _, k := range keys {
 		if v, ok := os.LookupEnv(k); ok {

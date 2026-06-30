@@ -97,6 +97,19 @@ func compile(pat string) (rule, bool) {
 	return r, true
 }
 
+// AddPatterns appends gitignore-style patterns (e.g. from GCGREP_EXCLUDE).
+func (m *Matcher) AddPatterns(patterns []string) {
+	for _, pat := range patterns {
+		pat = strings.TrimSpace(pat)
+		if pat == "" || strings.HasPrefix(pat, "#") || strings.HasPrefix(pat, "!") {
+			continue
+		}
+		if r, ok := compile(pat); ok {
+			m.rules = append(m.rules, r)
+		}
+	}
+}
+
 // Ignored reports whether the slash-separated relative path should be
 // skipped. isDir distinguishes directory-only rules.
 func (m *Matcher) Ignored(rel string, isDir bool) bool {
