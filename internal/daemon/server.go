@@ -267,9 +267,17 @@ func (sv *Server) handleSearch(req proto.Request, send func(proto.Event) error, 
 	}
 	if req.Gitignore {
 		gitTree := ignore.NewGitignoreTree(s.root)
+		incMatch := buildIncludeMatcher(req.Include)
 		inner := opts.PathMatch
 		opts.PathMatch = func(p string) bool {
-			return !gitTree.Ignored(p, false) && (inner == nil || inner(p))
+			stripped := p
+			if subPrefix != "" {
+				stripped = strings.TrimPrefix(p, subPrefix)
+			}
+			if gitTree.Ignored(p, false) && !incMatch(stripped) {
+				return false
+			}
+			return inner == nil || inner(p)
 		}
 	}
 	searchStart := time.Now()
@@ -550,6 +558,38 @@ func globMatcher(globs []string) (func(string) bool, error) {
 	}, nil
 }
 
+// globMatchAny reports whether any glob matches the full path, its basename,
+// or (for dir/* patterns) any descendant under that directory prefix.
+func globMatchAny(globs []string, p string) bool {
+	base := p
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		base = p[i+1:]
+	}
+	for _, g := range globs {
+		if ok, _ := filepath.Match(g, p); ok {
+			return true
+		}
+		if ok, _ := filepath.Match(g, base); ok {
+			return true
+		}
+		if strings.HasSuffix(g, "/*") {
+			if strings.HasPrefix(p, g[:len(g)-1]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// buildIncludeMatcher returns a func that reports whether a path matches
+// any --include glob. Returns a no-op (always false) when globs is empty.
+func buildIncludeMatcher(globs []string) func(string) bool {
+	if len(globs) == 0 {
+		return func(string) bool { return false }
+	}
+	return func(p string) bool { return globMatchAny(globs, p) }
+}
+
 // excludeIncludeMatcher builds a path filter from --exclude and --include
 // globs. Include overrides exclude: a path matching both is kept.
 func excludeIncludeMatcher(exclude, include []string) (func(string) bool, error) {
@@ -567,19 +607,7 @@ func excludeIncludeMatcher(exclude, include []string) (func(string) bool, error)
 		}
 	}
 	matchAny := func(globs []string, p string) bool {
-		base := p
-		if i := strings.LastIndexByte(p, '/'); i >= 0 {
-			base = p[i+1:]
-		}
-		for _, g := range globs {
-			if ok, _ := filepath.Match(g, p); ok {
-				return true
-			}
-			if ok, _ := filepath.Match(g, base); ok {
-				return true
-			}
-		}
-		return false
+		return globMatchAny(globs, p)
 	}
 	return func(p string) bool {
 		if len(include) > 0 && matchAny(include, p) {

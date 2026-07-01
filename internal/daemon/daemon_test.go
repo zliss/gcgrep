@@ -418,6 +418,46 @@ func TestExcludeIncludeMatcher(t *testing.T) {
 	}
 }
 
+func TestGlobMatchAnyDirPrefix(t *testing.T) {
+	if !globMatchAny([]string{"libs/spring/*"}, "libs/spring/org/core/Foo.java") {
+		t.Error("dir/* should match deep descendants")
+	}
+	if !globMatchAny([]string{"libs/spring/*"}, "libs/spring/Bar.java") {
+		t.Error("dir/* should match direct children")
+	}
+	if globMatchAny([]string{"libs/spring/*"}, "libs/jackson/Foo.java") {
+		t.Error("dir/* should not match sibling dirs")
+	}
+	if !globMatchAny([]string{"*.java"}, "src/Foo.java") {
+		t.Error("basename glob should match")
+	}
+}
+
+func TestIncludeOverridesGitignore(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, ".gitignore"), "libs/\n")
+	write(t, filepath.Join(root, "src", "Main.java"), "mainIncNeedle\n")
+	write(t, filepath.Join(root, "libs", "dep", "Lib.java"), "libIncNeedle\n")
+	write(t, filepath.Join(root, "libs", "other", "Other.java"), "otherIncNeedle\n")
+
+	cfg := conf.Default()
+	cfg.Gitignore = true
+	s, err := newRootStore(root, t.TempDir(), cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.WaitReady()
+
+	// gitignore=true at daemon level: libs/ not indexed at all
+	if len(hits(s, "libIncNeedle")) != 0 {
+		t.Error("libs/ should not be indexed with GCGREP_GITIGNORE")
+	}
+	if len(hits(s, "mainIncNeedle")) != 1 {
+		t.Error("src/ file should be indexed")
+	}
+}
+
 func TestGcgrepExcludeEnv(t *testing.T) {
 	root := t.TempDir()
 	write(t, filepath.Join(root, "ok.go"), "visibleExcNeedle\n")
